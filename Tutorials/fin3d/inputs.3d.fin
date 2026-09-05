@@ -1,0 +1,186 @@
+# 三维静水中的预定行波仿生鳍运动（Three-dimensional prescribed traveling-wave fin in initially quiescent water）
+# 所有物理量均使用国际单位制 (SI units: m, kg, s, Pa)
+
+# ==========================================
+# 时间步与物理时间控制 (【已优化】)
+# ==========================================
+# 将 max_step 设置为 -1 表示取消大步数量限制。
+# 算例现在将完全根据自适应物理时间演化，直到跑满 stop_time 指定的 10.0 秒为止自动停止。
+max_step = -1
+stop_time = 10.0
+
+# Level-0 层的时间步长 dt。开启子循环后，每向下一层细网格，dt就会除以2。
+# 正的 ns.fixed_dt 指定固定时间步；若需要 CFL 自适应步长，请自行设置 ns.fixed_dt < 0。
+ns.fixed_dt = 8.80256437073704e-3
+ns.init_dt = 8.80256437073704e-3
+# CFL 参数仅在使用自适应时间步时控制步长。
+ns.cfl = 0.5
+ns.init_iter = 0
+
+# ==========================================
+# AMR (自适应网格细化) 与计算域设置
+# ==========================================
+# 指定粒子（浸入边界点）的输入配置前缀
+particle.input = fin_inputs
+
+# 总共3层网格（Level 0~2），包含2个局部细化层。
+# 加密比例在 x, y, z 方向均为2，分辨率依次为16/8/4 mm。
+amr.max_level = 2
+amr.ref_ratio = 2 2
+# Level 0 (全局计算域) 的网格数量，分辨率为 16 mm
+amr.n_cell = 250 100 100
+
+# 定义2个固定的细化区域名称。
+# 仿生鳍的运动范围大约在 x=[0.8, 1.6] 以及 y,z=[0.748, 0.852] 之间。
+# 两个区域都向下游(+x)延伸，以更完整地解析和显示脱落涡与尾迹。
+amr.refinement_indicators = fin_level1 fin_level2
+
+# 第1层加密：扩大后的外围流场与尾迹过渡区（分辨率8 mm）
+amr.fin_level1.in_box_lo = 0.35 0.25 0.25
+amr.fin_level1.in_box_hi = 3.65 1.35 1.35
+amr.fin_level1.max_level = 1
+
+# 第2层加密：扩大后的最密鳍面与主要尾迹区（分辨率4 mm）
+# 鳍前方保留0.15 m缓冲，下游延伸到x=3.35 m，横向覆盖中心线两侧0.35 m。
+amr.fin_level2.in_box_lo = 0.65 0.45 0.45
+amr.fin_level2.in_box_hi = 3.35 1.15 1.15
+amr.fin_level2.max_level = 2
+
+# AMR网格分块策略。
+amr.n_error_buf = 2
+amr.max_grid_size = 64
+# Blocking factor 保证网格切分时是指定数字的倍数。
+# Level 0 设置为2即可(因为250是2的倍数，但不是4的倍数)。
+# Levels 1-2 设置为4，确保速度/扩散插值模板严格嵌套，防止出现 NaN 错误。
+amr.blocking_factor = 2 4 4
+amr.regrid_int = -1
+amr.subcycling_mode = Auto
+
+# ==========================================
+# 数据输出控制 (I/O) (【已优化】)
+# ==========================================
+# 当前 -1 关闭周期流场 Plotfile 和对应的鳍 VTK 输出；若设为12，间隔约为0.1056秒。
+# 减少集群硬盘写入带来的 I/O 阻塞。
+amr.plot_int = -1
+# 记录 Checkpoint 用于断点续算的频率 (每 114 步记录一次)
+amr.check_int = 114
+
+# 额外衍生输出变量：除了基础的 u,v,w 速度，额外在结果文件中写入“速度幅值”和“涡量幅值(mag_vort)”。
+# 方便直接在 ParaView 中查看。
+amr.derive_plot_vars = velocity_magnitude mag_vort
+
+ns.v = 1
+amr.v = 1
+# 关闭泊松求解器的刷屏输出以保持 log 干净
+nodal_proj.verbose = 0
+mac_proj.verbose = 0
+
+# ==========================================
+# 流体物理属性与湍流模型
+# ==========================================
+# 水的物性：密度 1000 kg/m^3, 动力粘度(mu) 1.0e-3 Pa·s (对应运动粘度 nu=1e-6 m^2/s)
+ns.fluid_rho = 1000.0
+ns.vel_visc_coef = 1.0e-3
+ns.scal_diff_coefs = 0.0
+ns.gravity = 0.0
+
+# 开启大涡模拟 (LES)，采用经典 Smagorinsky 模型，常系数 Cs=0.12
+ns.do_LES = 1
+ns.LES_model = Smagorinsky
+ns.smago_Cs_cst = 0.12
+
+ns.skip_level_projector = 0
+ns.isolver = 1
+# 开启弥散型浸入边界法 (Diffuse Immersed Boundary Method, DIBM)
+ns.do_diffused_ib = 1
+
+# ==========================================
+# 几何计算域与边界条件
+# ==========================================
+geometry.coord_sys = 0
+geometry.prob_lo = 0.0 0.0 0.0
+geometry.prob_hi = 4.0 1.6 1.6
+geometry.is_periodic = 0 0 0
+
+# 边界条件类型：
+# x-low(左侧): 1表示速度入口 (给定0速度，相当于死水)
+# x-high(右侧): 2表示压力出口
+# y, z 方向(侧面): 4表示滑移壁面(Slip walls)
+ns.lo_bc = 1 4 4
+ns.hi_bc = 2 4 4
+xlo.velocity = 0.0 0.0 0.0
+
+# 初始场为静止水体
+prob.probtype = 1
+particles.do_nspc_particles = 0
+
+# ==========================================
+# 压力泊松求解器参数 (切勿随意改小！)
+# ==========================================
+# 这里的 maxiter 是线性求解器(多重网格)的最大迭代次数上限。
+# 虽然设定为200，但满足 proj_tol (1e-8) 精度后就会提前停止。
+# 绝对不能改为小数字(如4)，否则压力场不收敛直接导致程序崩溃。
+nodal_proj.proj_tol = 1.e-8
+nodal_proj.proj_abs_tol = 1.e-9
+nodal_proj.maxiter = 200
+nodal_proj.bottom_maxiter = 200
+mac_proj.mac_tol = 1.e-8
+mac_proj.mac_abs_tol = 1.e-9
+
+# ==========================================
+# DIBM 与 仿生鳍运动学配置 (fin_inputs)
+# ==========================================
+# 身体原点坐标，计算力矩时以此为参考点。
+fin_inputs.x = 0.8
+fin_inputs.y = 0.8
+fin_inputs.z = 0.8
+fin_inputs.rho = 1000.0
+
+# radius 为兼容旧版粒子解析器保留，此处做碰撞占位符，几何类型 3 下实际不起作用。
+fin_inputs.radius = 0.026
+fin_inputs.geometry_type = 3
+
+# 整体刚体平动/转动速度设定为 0 (静水原地拍动)
+fin_inputs.velocity_x = 0.0
+fin_inputs.velocity_y = 0.0
+fin_inputs.velocity_z = 0.0
+fin_inputs.omega_x = 0.0
+fin_inputs.omega_y = 0.0
+fin_inputs.omega_z = 0.0
+
+# 预定运动不需要平动和转动约束限制。
+fin_inputs.TLX = 0
+fin_inputs.TLY = 0
+fin_inputs.TLZ = 0
+fin_inputs.RLX = 0
+fin_inputs.RLY = 0
+fin_inputs.RLZ = 0
+
+# 行波方程参数设定：
+# X(s,r,t) = origin + (s, r*cos(theta), r*sin(theta))
+# theta(s,t) = A*sin(2*pi*f*t - 2*pi*s/lambda + phase)
+fin_inputs.fin_length = 0.8          # 鳍长 (m)
+fin_inputs.fin_span = 0.052          # 展长/厚度相关 (m)
+fin_inputs.fin_amplitude_deg = 85.0  # 拍动最大幅值 (角度)
+fin_inputs.fin_frequency = 1.0       # 拍动频率 f = 1.0 Hz
+fin_inputs.fin_wavelength = 0.4      # 行波波长 lambda = 0.4 m
+fin_inputs.fin_phase = 0.0           # 初始相位
+
+# 固壁网格标记点数量。
+# 201x14 对应弦向和展向约4 mm间距，与 Eulerian Level-2 网格匹配。
+# 避免继续使用1 mm点距造成过密插值和不必要的MPI通信开销。
+fin_inputs.fin_n_chord = 201
+fin_inputs.fin_n_span = 14
+
+# ==========================================
+# 流固耦合(DIBM)迭代控制 (【已优化】)
+# ==========================================
+# 【提速优化】：流体与固体力的耦合传递迭代次数降为 2 次。
+# 因为是给定位移的强迫运动，2次迭代足以保证力的稳定计算，从而大幅节省泊松求解时间。
+fin_inputs.LOOP_NS = 2
+fin_inputs.LOOP_SOLID = 1
+fin_inputs.RD = 0.0
+
+# 仿生受力数据输出频率 (每 10 个最细层时间步记录一次 CSV 表格)
+fin_inputs.write_freq = 10
+fin_inputs.verbose = 0

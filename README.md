@@ -56,6 +56,14 @@ IAMReX is a fork of the original [IAMR](https://github.com/AMReX-Fluids/IAMR) co
 
 - [Cluster of monodisperse particles](./Tutorials/Monodisperse/)
 
+- [Two-dimensional traveling-wave fin (fiber)](./Tutorials/Fiber/)
+
+- [Three-dimensional traveling-wave fin](./Tutorials/fin3d/)
+
+The prescribed-fin implementations share the DIBM solver and are selected by
+`DIM=2` or `DIM=3`. See the [integration notes](./Docs/Fin_Integration.md) for
+input conventions, source provenance, and validation status.
+
 For more details, please check the document: [sample-cases](https://ruohai0925.github.io/IAMReX/Introduction_Chapter.html#sample-cases)
 
 ## Installation

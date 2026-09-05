@@ -13,7 +13,9 @@
 #include <AMReX_RealVect.H>
 #include <fstream>
 
+#if (AMREX_SPACEDIM == 3)
 #include "Collision.H"
+#endif
 using namespace amrex;
 // using deltaFuncType = std::function<AMREX_GPU_HOST_DEVICE void(Real, Real, Real, Real&)>;
 
@@ -52,6 +54,7 @@ enum DELTA_FUNCTION_TYPE{
     THREE_POINT_IB
 };
 
+#if (AMREX_SPACEDIM == 3)
 struct kernel{
     int id;
     RealVect velocity{0.0,0.0,0.0};
@@ -66,7 +69,7 @@ struct kernel{
     Real radius{0.0};
     Real radius2{0.0};
     Real radius3{0.0};
-    int geometry_type{1};  // 1 = sphere, 2 = ellipsoid; any other value aborts
+    int geometry_type{1};  // 1 = sphere, 2 = ellipsoid, 3 = prescribed traveling-wave fin
     Real rho{0.0};
     int ml{0};
     Real dv{0.0};
@@ -86,6 +89,18 @@ struct kernel{
     amrex::Gpu::DeviceVector<Real> thetaK;
 
     IntVect TL{0, 0, 0}, RL{0, 0, 0};
+
+    // Prescribed traveling-wave fin.  The reference surface is
+    // X(s,r,0) = location + (s,r,0), with 0<=s<=length and 0<=r<=span.
+    Real fin_length{0.0};
+    Real fin_span{0.0};
+    Real fin_amplitude{0.0};       // radians
+    Real fin_frequency{0.0};       // Hz
+    Real fin_wavelength{0.0};
+    Real fin_phase{0.0};           // radians
+    Real fin_marker_thickness{0.0};
+    int fin_n_chord{0};
+    int fin_n_span{0};
 };
 
 class mParIter : public ParIter<0, 0, numAttri>{
@@ -143,7 +158,10 @@ public:
                        Real gravity,
                        int verbose = 0);
 
-    void InteractWithEuler(MultiFab &EulerVel, MultiFab &EulerForce, Real dt = 0.1, DELTA_FUNCTION_TYPE type = FOUR_POINT_IB);
+    void InteractWithEuler(MultiFab &EulerVel, MultiFab &EulerForce,
+                           Real dt = 0.1,
+                           DELTA_FUNCTION_TYPE type = FOUR_POINT_IB,
+                           Real boundary_time = 0.0);
 
     void WriteParticleFile(int index);
 
@@ -159,11 +177,16 @@ public:
 
     void VelocityCorrection(amrex::MultiFab &Euler, amrex::MultiFab &EulerForce, Real dt) const;
 
-    void UpdateParticles(int iStep, Real time, const MultiFab& Euler_old, const MultiFab& Euler, MultiFab& phi_nodal, MultiFab& pvf, Real dt);
+    void UpdateParticles(int iStep, int finestStep, Real time,
+                         const MultiFab& Euler_old, const MultiFab& Euler,
+                         MultiFab& phi_nodal, MultiFab& pvf, Real dt);
 
     void DoParticleCollision(int model);
 
     static void WriteIBForceAndMoment(int step, amrex::Real time, amrex::Real dt, kernel& current_kernel);
+
+    static void WriteFinVTK(int step, amrex::Real time, const kernel& current_kernel,
+                            const std::string& output_dir = "");
 
     void RecordOldValue(kernel& kernel);
 
@@ -182,6 +205,8 @@ public:
     int verbose = 0;
 
     Real spend_time;
+
+    Real ib_time{0.0};
 };
 
 class Particles{
@@ -209,5 +234,7 @@ public:
 private:
     inline static mParticle* particle = nullptr;
 };
+
+#endif // AMREX_SPACEDIM == 3
 
 #endif

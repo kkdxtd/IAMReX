@@ -15,6 +15,7 @@
 #include <iamr_constants.H>
 
 #include <filesystem>
+#include <iomanip>
 #include <sstream>
 namespace fs = std::filesystem;
 
@@ -54,6 +55,16 @@ namespace ParticleProperties{
 
     int write_freq{1};
     bool init_particle_from_file{false};
+
+    // geometry_type=3: prescribed traveling-wave fin parameters.
+    Real fin_length{0.0};
+    Real fin_span{0.0};
+    Real fin_amplitude_deg{0.0};
+    Real fin_frequency{0.0};
+    Real fin_wavelength{0.0};
+    Real fin_phase{0.0};
+    int fin_n_chord{0};
+    int fin_n_span{0};
 
     GpuArray<Real, 3> plo{0.0,0.0,0.0}, phi{0.0,0.0,0.0}, dx{0.0, 0.0, 0.0};
 }
@@ -103,10 +114,8 @@ void nodal_phi_to_pvf(MultiFab& pvf, const MultiFab& phi_nodal)
 
 }
 
-// Fill phi_nodal with the nodal level set of a single particle: negative inside
-// the body, positive outside. Handles geometry_type = 1 (sphere, signed distance
-// normalised by the radius) and geometry_type = 2 (ellipsoid, a first-order
-// approximation that is deliberately left unnormalised). Any other value aborts.
+// Nodal level set for closed rigid bodies (sphere or ellipsoid).
+// Prescribed fins bypass this volume calculation in UpdateParticles.
 void calculate_phi_nodal(MultiFab& phi_nodal, kernel& current_kernel)
 {
     phi_nodal.setVal(0.0);
@@ -326,11 +335,13 @@ void deltaFunction(Real xf, Real xp, Real h, Real& value, DELTA_FUNCTION_TYPE ty
 void mParticle::InteractWithEuler(MultiFab &EulerVel,
                                   MultiFab &EulerForce,
                                   Real dt,
-                                  DELTA_FUNCTION_TYPE type)
+                                  DELTA_FUNCTION_TYPE type,
+                                  Real boundary_time)
 {
     if (verbose) amrex::Print() << "[Particle] mParticle::InteractWithEuler\n";
     // clear time , start record
     spend_time = 0;
+    ib_time = boundary_time;
     auto InteractWithEulerStart = ParallelDescriptor::second();
 
     MultiFab EulerForceTmp(EulerForce.boxArray(), EulerForce.DistributionMap(), 3, EulerForce.nGrow());
@@ -462,6 +473,46 @@ void mParticle::InitParticles(const Vector<Real>& x,
         }
         mKernel.Vp = Math::pi<Real>() * 4 / 3 * Math::powi<3>(radius[real_index]);
 
+        if (mKernel.geometry_type == 3) {
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ParticleProperties::fin_length > 0.0,
+                "traveling-wave fin requires fin_length > 0");
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ParticleProperties::fin_span > 0.0,
+                "traveling-wave fin requires fin_span > 0");
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ParticleProperties::fin_wavelength > 0.0,
+                "traveling-wave fin requires fin_wavelength > 0");
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(ParticleProperties::fin_n_chord >= 2 && ParticleProperties::fin_n_span >= 2,
+                "traveling-wave fin requires fin_n_chord and fin_n_span >= 2");
+
+            mKernel.fin_length = ParticleProperties::fin_length;
+            mKernel.fin_span = ParticleProperties::fin_span;
+            mKernel.fin_amplitude = ParticleProperties::fin_amplitude_deg * Math::pi<Real>() / 180.0;
+            mKernel.fin_frequency = ParticleProperties::fin_frequency;
+            mKernel.fin_wavelength = ParticleProperties::fin_wavelength;
+            mKernel.fin_phase = ParticleProperties::fin_phase;
+            mKernel.fin_n_chord = ParticleProperties::fin_n_chord;
+            mKernel.fin_n_span = ParticleProperties::fin_n_span;
+            mKernel.fin_marker_thickness = h;
+            mKernel.ml = mKernel.fin_n_chord * mKernel.fin_n_span;
+            mKernel.dv = h * mKernel.fin_length / (mKernel.fin_n_chord - 1)
+                           * mKernel.fin_span / (mKernel.fin_n_span - 1);
+            mKernel.Vp = 0.0;
+            if (mKernel.ml > max_largrangian_num) max_largrangian_num = mKernel.ml;
+            particle_kernels.emplace_back(mKernel);
+
+            if (verbose) {
+                amrex::Print() << "Fin kernel " << mKernel.id
+                               << ": origin=(" << mKernel.location[0] << ","
+                               << mKernel.location[1] << "," << mKernel.location[2] << ")"
+                               << ", length=" << mKernel.fin_length
+                               << ", span=" << mKernel.fin_span
+                               << ", markers=" << mKernel.fin_n_chord << "x" << mKernel.fin_n_span
+                               << ", amplitude(rad)=" << mKernel.fin_amplitude
+                               << ", frequency=" << mKernel.fin_frequency
+                               << ", wavelength=" << mKernel.fin_wavelength << "\n";
+            }
+            continue;
+        }
+
         //int Ml = static_cast<int>( Math::pi<Real>() / 3 * (12 * Math::powi<2>(mKernel.radius / h)));
         //Real dv = Math::pi<Real>() * h / 3 / Ml * (12 * mKernel.radius * mKernel.radius + h * h);
         int Ml = static_cast<int>((amrex::Math::powi<3>(mKernel.radius - (ParticleProperties::rd - 0.5) * h)
@@ -506,15 +557,39 @@ void mParticle::InitialWithLargrangianPoints(const kernel& current_kernel){
 
         const auto location = current_kernel.location;
         const auto radius = current_kernel.radius;
+        const auto geometry_type = current_kernel.geometry_type;
         const auto* phiK = current_kernel.phiK.dataPtr();
         const auto* thetaK = current_kernel.thetaK.dataPtr();
+        const auto fin_length = current_kernel.fin_length;
+        const auto fin_span = current_kernel.fin_span;
+        const auto fin_amplitude = current_kernel.fin_amplitude;
+        const auto fin_frequency = current_kernel.fin_frequency;
+        const auto fin_wavelength = current_kernel.fin_wavelength;
+        const auto fin_phase = current_kernel.fin_phase;
+        const auto fin_n_chord = current_kernel.fin_n_chord;
+        const auto fin_n_span = current_kernel.fin_n_span;
+        const auto time = ib_time;
 
         amrex::ParallelFor( np, [=]
             AMREX_GPU_DEVICE (int i) noexcept {
                 auto id = particles[i].id();
-                particles[i].pos(0) = location[0] + radius * std::sin(thetaK[id - 1]) * std::cos(phiK[id - 1]);
-                particles[i].pos(1) = location[1] + radius * std::sin(thetaK[id - 1]) * std::sin(phiK[id - 1]);
-                particles[i].pos(2) = location[2] + radius * std::cos(thetaK[id - 1]);
+                if (geometry_type == 3) {
+                    const int local_id = static_cast<int>(id - 1);
+                    const int chord_id = local_id / fin_n_span;
+                    const int span_id = local_id - chord_id * fin_n_span;
+                    const Real s = fin_length * chord_id / Real(fin_n_chord - 1);
+                    const Real r = fin_span * span_id / Real(fin_n_span - 1);
+                    const Real theta = fin_amplitude * std::sin(
+                        2.0 * Math::pi<Real>() * fin_frequency * time
+                        - 2.0 * Math::pi<Real>() * s / fin_wavelength + fin_phase);
+                    particles[i].pos(0) = location[0] + s;
+                    particles[i].pos(1) = location[1] + r * std::cos(theta);
+                    particles[i].pos(2) = location[2] + r * std::sin(theta);
+                } else {
+                    particles[i].pos(0) = location[0] + radius * std::sin(thetaK[id - 1]) * std::cos(phiK[id - 1]);
+                    particles[i].pos(1) = location[1] + radius * std::sin(thetaK[id - 1]) * std::sin(phiK[id - 1]);
+                    particles[i].pos(2) = location[2] + radius * std::cos(thetaK[id - 1]);
+                }
             }
         );
     }
@@ -695,13 +770,25 @@ void mParticle::ForceSpreading(MultiFab & EulerForce,
 
         auto loc_ptr = kernel.location;
         auto dv = kernel.dv;
+        const auto geometry_type = kernel.geometry_type;
+        const auto fin_n_chord = kernel.fin_n_chord;
+        const auto fin_n_span = kernel.fin_n_span;
         auto force_index = ParticleProperties::euler_force_index;
         amrex::ParallelFor(np, [=]
         AMREX_GPU_DEVICE (int i) noexcept{
+            Real marker_volume = dv;
+            if (geometry_type == 3) {
+                const int local_id = static_cast<int>(p_ptr[i].id() - 1);
+                const int chord_id = local_id / fin_n_span;
+                const int span_id = local_id - chord_id * fin_n_span;
+                const Real chord_weight = (chord_id == 0 || chord_id == fin_n_chord - 1) ? 0.5 : 1.0;
+                const Real span_weight = (span_id == 0 || span_id == fin_n_span - 1) ? 0.5 : 1.0;
+                marker_volume *= chord_weight * span_weight;
+            }
             ForceSpreading_cic(p_ptr[i], loc_ptr[0], loc_ptr[1], loc_ptr[2],
                                fxP_ptr[i], fyP_ptr[i], fzP_ptr[i],
                                mxP_ptr[i], myP_ptr[i], mzP_ptr[i],
-                               Uarray, force_index, dv, plo, dxi, type);
+                               Uarray, force_index, marker_volume, plo, dxi, type);
         });
     }
     //barrier for sync;
@@ -794,6 +881,7 @@ void mParticle::ResetLargrangianPoints()
 }
 
 void mParticle::UpdateParticles(int iStep,
+                                int finestStep,
                                 Real time,
                                 const MultiFab& Euler_old,
                                 const MultiFab& Euler,
@@ -813,6 +901,15 @@ void mParticle::UpdateParticles(int iStep,
 
     //continue condition 6DOF
     for(auto& kernel : particle_kernels){
+
+        // A prescribed zero-thickness fin is coupled only through its
+        // Lagrangian surface.  It has no closed volume for PVF and does not
+        // participate in collision or rigid-body (6-DOF) advancement.
+        if (kernel.geometry_type == 3) {
+            phi_nodal.setVal(1.0);
+            pvf.setVal(0.0);
+            continue;
+        }
 
         calculate_phi_nodal(phi_nodal, kernel);
         nodal_phi_to_pvf(pvf, phi_nodal);
@@ -945,17 +1042,31 @@ void mParticle::UpdateParticles(int iStep,
     amrex::Print() << "[DIBM] IB and update particle, step : "<< iStep <<", time : " << spend_time << "\n";
 
     int particle_write_freq = ParticleProperties::write_freq;
-    if (iStep % particle_write_freq == 0) {
-        for(auto kernel: particle_kernels)
-            WriteIBForceAndMoment(iStep, time, dt, kernel);
+    for (auto kernel : particle_kernels) {
+        // Under AMR subcycling the prescribed fin advances on the finest
+        // level.  Use that level's step counter so write_freq keeps its
+        // original fine-step meaning.  Rigid-particle output remains tied to
+        // the coarse step for backward compatibility.
+        const int output_step = kernel.geometry_type == 3 ? finestStep : iStep;
+        if (output_step % particle_write_freq == 0) {
+            WriteIBForceAndMoment(output_step,
+                                  kernel.geometry_type == 3 ? time + dt : time,
+                                  dt, kernel);
+        }
     }
-
     if (verbose) mContainer->WriteAsciiFile(amrex::Concatenate("particle", 4));
 }
 
 void mParticle::DoParticleCollision(int model)
 {
     if(particle_kernels.size() < 2 ) return ;
+
+    // Prescribed surfaces have no collision model in this first-stage fin
+    // implementation.  Do not pass their placeholder radius to the rigid
+    // particle collision system in a mixed configuration.
+    for (const auto& particle_kernel : particle_kernels) {
+        if (particle_kernel.geometry_type == 3) return;
+    }
 
     if (verbose) amrex::Print() << "\tmParticle::DoParticleCollision\n";
 
@@ -990,6 +1101,16 @@ void mParticle::ComputeLagrangianForce(Real dt,
     Real Py = kernel.location[1];
     Real Pz = kernel.location[2];
     RealVect omega_local = kernel.omega;
+    const auto geometry_type = kernel.geometry_type;
+    const auto fin_span = kernel.fin_span;
+    const auto fin_length = kernel.fin_length;
+    const auto fin_amplitude = kernel.fin_amplitude;
+    const auto fin_frequency = kernel.fin_frequency;
+    const auto fin_wavelength = kernel.fin_wavelength;
+    const auto fin_phase = kernel.fin_phase;
+    const auto fin_n_chord = kernel.fin_n_chord;
+    const auto fin_n_span = kernel.fin_n_span;
+    const auto time = ib_time;
 
     for(mParIter pti(*mContainer, LOCAL_LEVEL); pti.isValid(); ++pti){
         const Long np = pti.numParticles();
@@ -1005,10 +1126,32 @@ void mParticle::ComputeLagrangianForce(Real dt,
 
         amrex::ParallelFor(np,
         [=] AMREX_GPU_DEVICE (int i) noexcept{
-            auto Ur = omega_local.crossProduct(RealVect(p_ptr[i].pos(0) - Px, p_ptr[i].pos(1) - Py, p_ptr[i].pos(2) - Pz));
-            FxP[i] = (Ub + Ur[0] - Up[i])/dt; //
-            FyP[i] = (Vb + Ur[1] - Vp[i])/dt; //
-            FzP[i] = (Wb + Ur[2] - Wp[i])/dt; //
+            Real target_u = Ub;
+            Real target_v = Vb;
+            Real target_w = Wb;
+            if (geometry_type == 3) {
+                const int local_id = static_cast<int>(p_ptr[i].id() - 1);
+                const int chord_id = local_id / fin_n_span;
+                const int span_id = local_id - chord_id * fin_n_span;
+                const Real s = fin_length * chord_id / Real(fin_n_chord - 1);
+                const Real r = fin_span * span_id / Real(fin_n_span - 1);
+                const Real argument = 2.0 * Math::pi<Real>() * fin_frequency * time
+                                    - 2.0 * Math::pi<Real>() * s / fin_wavelength + fin_phase;
+                const Real theta = fin_amplitude * std::sin(argument);
+                const Real theta_dot = 2.0 * Math::pi<Real>() * fin_frequency
+                                     * fin_amplitude * std::cos(argument);
+                target_u = 0.0;
+                target_v = -r * std::sin(theta) * theta_dot;
+                target_w =  r * std::cos(theta) * theta_dot;
+            } else {
+                auto Ur = omega_local.crossProduct(RealVect(p_ptr[i].pos(0) - Px, p_ptr[i].pos(1) - Py, p_ptr[i].pos(2) - Pz));
+                target_u += Ur[0];
+                target_v += Ur[1];
+                target_w += Ur[2];
+            }
+            FxP[i] = (target_u - Up[i])/dt;
+            FyP[i] = (target_v - Vp[i])/dt;
+            FzP[i] = (target_w - Wp[i])/dt;
         });
     }
     if (verbose) mContainer->WriteAsciiFile(amrex::Concatenate("particle", 3));
@@ -1036,6 +1179,32 @@ void mParticle::WriteIBForceAndMoment(int step, amrex::Real time, amrex::Real dt
 {
 
     if(amrex::ParallelDescriptor::MyProc() != ParallelDescriptor::IOProcessorNumber()) return;
+
+    if (current_kernel.geometry_type == 3) {
+        const std::string file("IB_Fin_" + std::to_string(current_kernel.id) + ".csv");
+        const bool new_file = !fs::exists(file);
+        std::ofstream out(file, std::ios::app);
+        if (!out.is_open()) {
+            amrex::Print() << "[DIBM] cannot open fin force file " << file << "\n";
+            return;
+        }
+        if (new_file) {
+            out << "step,time,phase,Fx,Fy,Fz,Mx,My,Mz\n";
+        }
+        const Real phase = 2.0 * Math::pi<Real>() * current_kernel.fin_frequency * time
+                         + current_kernel.fin_phase;
+        // Marker force is the acceleration applied to the fluid.  Multiplying
+        // by rho gives force; the minus sign gives fluid-on-fin load.
+        const Real rho = ParticleProperties::euler_fluid_rho;
+        out << step << "," << time << "," << phase << ","
+            << -rho * current_kernel.ib_force[0] << ","
+            << -rho * current_kernel.ib_force[1] << ","
+            << -rho * current_kernel.ib_force[2] << ","
+            << -rho * current_kernel.ib_moment[0] << ","
+            << -rho * current_kernel.ib_moment[1] << ","
+            << -rho * current_kernel.ib_moment[2] << "\n";
+        return;
+    }
 
     std::string file("IB_Particle_" + std::to_string(current_kernel.id) + ".csv");
     std::ofstream out_ib_force;
@@ -1069,6 +1238,85 @@ void mParticle::WriteIBForceAndMoment(int step, amrex::Real time, amrex::Real dt
     out_ib_force.close();
 }
 
+void mParticle::WriteFinVTK(int step, amrex::Real time, const kernel& current_kernel,
+                            const std::string& output_dir)
+{
+    if (amrex::ParallelDescriptor::MyProc() != ParallelDescriptor::IOProcessorNumber()) return;
+    if (current_kernel.geometry_type != 3) return;
+
+    const int nc = current_kernel.fin_n_chord;
+    const int nr = current_kernel.fin_n_span;
+    const int npoints = nc * nr;
+    const int ntriangles = 2 * (nc - 1) * (nr - 1);
+    const std::string prefix = current_kernel.id == 1
+                             ? "fin_"
+                             : "fin_" + std::to_string(current_kernel.id) + "_";
+    const std::string base_name = amrex::Concatenate(prefix, step, 8) + ".vtk";
+
+    if (!output_dir.empty()) {
+        std::error_code ec;
+        fs::create_directories(output_dir, ec);
+        if (ec) {
+            amrex::Print() << "[DIBM] cannot create fin VTK directory "
+                           << output_dir << ": " << ec.message() << "\n";
+            return;
+        }
+    }
+    const std::string file = output_dir.empty() ? base_name
+                                                 : output_dir + "/" + base_name;
+    std::ofstream out(file);
+    if (!out.is_open()) {
+        amrex::Print() << "[DIBM] cannot open fin VTK file " << file << "\n";
+        return;
+    }
+
+    out << "# vtk DataFile Version 3.0\n"
+        << "IAMReX prescribed traveling-wave fin, time=" << time << "\n"
+        << "ASCII\n"
+        << "DATASET POLYDATA\n"
+        << "POINTS " << npoints << " double\n"
+        << std::setprecision(16);
+
+    for (int ic = 0; ic < nc; ++ic) {
+        const Real s = current_kernel.fin_length * ic / Real(nc - 1);
+        const Real argument = 2.0 * Math::pi<Real>() * current_kernel.fin_frequency * time
+                            - 2.0 * Math::pi<Real>() * s / current_kernel.fin_wavelength
+                            + current_kernel.fin_phase;
+        const Real theta = current_kernel.fin_amplitude * std::sin(argument);
+        for (int ir = 0; ir < nr; ++ir) {
+            const Real r = current_kernel.fin_span * ir / Real(nr - 1);
+            out << current_kernel.location[0] + s << " "
+                << current_kernel.location[1] + r * std::cos(theta) << " "
+                << current_kernel.location[2] + r * std::sin(theta) << "\n";
+        }
+    }
+
+    out << "POLYGONS " << ntriangles << " " << 4 * ntriangles << "\n";
+    for (int ic = 0; ic < nc - 1; ++ic) {
+        for (int ir = 0; ir < nr - 1; ++ir) {
+            const int p0 = ic * nr + ir;
+            const int p1 = p0 + 1;
+            const int p2 = (ic + 1) * nr + ir;
+            const int p3 = p2 + 1;
+            out << "3 " << p0 << " " << p1 << " " << p2 << "\n";
+            out << "3 " << p1 << " " << p3 << " " << p2 << "\n";
+        }
+    }
+
+    const Real rho = ParticleProperties::euler_fluid_rho;
+    out << "FIELD FieldData 4\n"
+        << "step 1 1 int\n" << step << "\n"
+        << "time 1 1 double\n" << time << "\n"
+        << "fluid_on_fin_force 3 1 double\n"
+        << -rho * current_kernel.ib_force[0] << " "
+        << -rho * current_kernel.ib_force[1] << " "
+        << -rho * current_kernel.ib_force[2] << "\n"
+        << "fluid_on_fin_moment 3 1 double\n"
+        << -rho * current_kernel.ib_moment[0] << " "
+        << -rho * current_kernel.ib_moment[1] << " "
+        << -rho * current_kernel.ib_moment[2] << "\n";
+}
+
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                    Particles member function                  */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1100,12 +1348,7 @@ void Particles::create_particles(const Geometry &gm,
             markerP.pos(2) = particle->particle_kernels[0].location[2];
 
             std::array<ParticleReal, numAttri> Marker_attr;
-            Marker_attr[U_Marker] = 0.0;
-            Marker_attr[V_Marker] = 0.0;
-            Marker_attr[W_Marker] = 0.0;
-            Marker_attr[Fx_Marker] = 0.0;
-            Marker_attr[Fy_Marker] = 0.0;
-            Marker_attr[Fz_Marker] = 0.0;
+            Marker_attr.fill(0.0);
 
             particleTileTmp.push_back(markerP);
             particleTileTmp.push_back_real(Marker_attr);
@@ -1192,6 +1435,9 @@ void Particles::Restart(Real gravity, Real h, int iStep)
     //deal in IO processor
     //start read csv file
     for(auto& kernel : particle->particle_kernels){
+        // Prescribed fin state is an analytic function of checkpoint time;
+        // there is no rigid-body state to recover from a particle CSV file.
+        if (kernel.geometry_type == 3) continue;
         //filename
         if(amrex::ParallelDescriptor::MyProc() == amrex::ParallelDescriptor::IOProcessorNumber()){
             std::string fileName = "IB_Particle_" + std::to_string(kernel.id) + ".csv";
@@ -1294,6 +1540,14 @@ void Particles::Initialize()
         p_file.query("Uhlmann",     ParticleProperties::Uhlmann);
         p_file.query("collision_model", ParticleProperties::collision_model);
         p_file.query("write_freq",  ParticleProperties::write_freq);
+        p_file.query("fin_length",        ParticleProperties::fin_length);
+        p_file.query("fin_span",          ParticleProperties::fin_span);
+        p_file.query("fin_amplitude_deg", ParticleProperties::fin_amplitude_deg);
+        p_file.query("fin_frequency",     ParticleProperties::fin_frequency);
+        p_file.query("fin_wavelength",    ParticleProperties::fin_wavelength);
+        p_file.query("fin_phase",         ParticleProperties::fin_phase);
+        p_file.query("fin_n_chord",       ParticleProperties::fin_n_chord);
+        p_file.query("fin_n_span",        ParticleProperties::fin_n_span);
 
         ParmParse ns("ns");
         ns.get("fluid_rho",      ParticleProperties::euler_fluid_rho);

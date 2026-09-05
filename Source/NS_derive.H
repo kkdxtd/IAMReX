@@ -36,6 +36,12 @@ namespace derive_functions {
           const amrex::FArrayBox& datfab, const amrex::Geometry& geomdata,
           amrex::Real time, const int* bcrec, int level);
   //
+  // Compute the magnitude of the cell-centered velocity vector
+  //
+  void dermagvel (const amrex::Box& bx, amrex::FArrayBox& derfab, int dcomp, int ncomp,
+          const amrex::FArrayBox& datfab, const amrex::Geometry& geomdata,
+          amrex::Real time, const int* bcrec, int level);
+  //
   // Compute kinetic energy
   //
   void derkeng (const amrex::Box& bx, amrex::FArrayBox& derfab, int dcomp, int ncomp,

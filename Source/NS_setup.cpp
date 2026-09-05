@@ -484,6 +484,11 @@ NavierStokes::variableSetUp ()
     derive_lst.addComponent("energy",desc_lst,State_Type,Density,1);
     derive_lst.addComponent("energy",desc_lst,State_Type,Xvel,AMREX_SPACEDIM);
     //
+    // velocity magnitude
+    //
+    derive_lst.add("velocity_magnitude",IndexType::TheCellType(),1,dermagvel,the_same_box);
+    derive_lst.addComponent("velocity_magnitude",desc_lst,State_Type,Xvel,AMREX_SPACEDIM);
+    //
     // magnitude of vorticity
     //
     derive_lst.add("mag_vort",IndexType::TheCellType(),1,dermgvort,grow_box_by_two);

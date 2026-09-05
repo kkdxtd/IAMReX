@@ -17,7 +17,9 @@
 #include <NS_kernels.H>
 
 #ifdef AMREX_PARTICLES
-#ifdef PARTICLE_PARALLEL
+#if (AMREX_SPACEDIM == 2)
+#include "DiffusedFiber.H"
+#elif defined(PARTICLE_PARALLEL)
 #include "DiffusedIB_Parallel.H"
 #else
 #include "DiffusedIB.H"
@@ -1214,8 +1216,27 @@ NavierStokes::writePlotFilePost (const std::string& dir,
 #endif
 
 #ifdef AMREX_PARTICLES
-    if(level == parent->finestLevel()){
-        Particles::get_particles()->mContainer->Checkpoint(dir, "particles");
+    if (do_diffused_ib && level == parent->finestLevel()) {
+#if (AMREX_SPACEDIM == 2)
+        auto* fibers = Fibers::get_fibers();
+        if (fibers && fibers->mContainer) {
+            fibers->mContainer->Checkpoint(dir, "fibers");
+        }
+#else
+        auto* particles = Particles::get_particles();
+        if (particles && particles->mContainer) {
+            particles->mContainer->Checkpoint(dir, "particles");
+#ifndef PARTICLE_PARALLEL
+            const int plot_step = parent->levelSteps(0);
+            const Real plot_time = state[State_Type].curTime();
+            for (const auto& body : particles->particle_kernels) {
+                if (body.geometry_type == 3) {
+                    mParticle::WriteFinVTK(plot_step, plot_time, body, "fin_vtk");
+                }
+            }
+#endif
+        }
+#endif
     }
 #endif
 
@@ -2667,7 +2688,9 @@ NavierStokes::advance_semistaggered_fsi_diffusedib (Real time,
 
         // Step 2: calculate pvf from the nodal level set function (only for internal cells)
         pvf.setVal(0.0);
+#if (AMREX_SPACEDIM == 3)
         nodal_phi_to_pvf(pvf, phi_nodal);
+#endif
 
         // Step 3 (optional): copy for visualization
         MultiFab&  S_new    = get_new_data(State_Type);
@@ -2725,16 +2748,24 @@ NavierStokes::advance_semistaggered_fsi_diffusedib (Real time,
         velocity_update(dt);
 
 #ifdef AMREX_PARTICLES
-        if (level == Particles::ParticleFinestLevel())//parent->finestLevel())
-        {
-            MultiFab&  S_new    = get_new_data(State_Type);
-            // S_new.setVal(1.0, 0, 1, S_new.nGrow()); // u = 1
-            // S_new.setVal(2.0, 1, 1, S_new.nGrow()); // v = 2
-            // S_new.setVal(3.0, 2, 1, S_new.nGrow()); // w = 3
-            MultiFab EulerForce(S_new.boxArray(), S_new.DistributionMap(), 3, S_new.nGrow());
-            Particles::get_particles()->InteractWithEuler(S_new, EulerForce, dt); // parent->levelSteps(0), time
+#if (AMREX_SPACEDIM == 2)
+        if (level == Fibers::FiberFinestLevel()) {
+            MultiFab& S_new = get_new_data(State_Type);
+            MultiFab EulerForce(S_new.boxArray(), S_new.DistributionMap(), 2, S_new.nGrow());
+            Fibers::get_fibers()->InteractWithEuler(S_new, EulerForce, dt, FOUR_POINT_IB, time + dt);
         }
-        //amrex::Abort("Stop here!");
+#else
+        if (level == Particles::ParticleFinestLevel()) {
+            MultiFab& S_new = get_new_data(State_Type);
+            MultiFab EulerForce(S_new.boxArray(), S_new.DistributionMap(), 3, S_new.nGrow());
+#ifdef PARTICLE_PARALLEL
+            Particles::get_particles()->InteractWithEuler(S_new, EulerForce, dt);
+#else
+            // Evaluate prescribed geometry and velocity at the new fluid time.
+            Particles::get_particles()->InteractWithEuler(S_new, EulerForce, dt, FOUR_POINT_IB, time + dt);
+#endif
+        }
+#endif
 #endif
         //
         // Increment rho average.
@@ -2779,12 +2810,22 @@ NavierStokes::advance_semistaggered_fsi_diffusedib (Real time,
             p_avg.setVal(0);
         }
 #ifdef AMREX_PARTICLES
-        if (level == Particles::ParticleFinestLevel())//parent->finestLevel())
-        {
-            MultiFab&  S_new    = get_new_data(State_Type);
-            MultiFab&  S_old    = get_old_data(State_Type);
-            Particles::get_particles()->UpdateParticles(parent->levelSteps(0), time, S_old, S_new, phi_nodal, pvf, dt);
+#if (AMREX_SPACEDIM == 2)
+        if (level == Fibers::FiberFinestLevel()) {
+            Fibers::get_fibers()->UpdateFibers(parent->levelSteps(level), time + dt, dt);
         }
+#else
+        if (level == Particles::ParticleFinestLevel()) {
+            MultiFab& S_new = get_new_data(State_Type);
+            MultiFab& S_old = get_old_data(State_Type);
+#ifdef PARTICLE_PARALLEL
+            Particles::get_particles()->UpdateParticles(parent->levelSteps(0), time, S_old, S_new, phi_nodal, pvf, dt);
+#else
+            Particles::get_particles()->UpdateParticles(parent->levelSteps(0), parent->levelSteps(level),
+                                                       time, S_old, S_new, phi_nodal, pvf, dt);
+#endif
+        }
+#endif
 #endif
 
 #ifdef AMREX_PARTICLES

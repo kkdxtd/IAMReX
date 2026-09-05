@@ -12,6 +12,30 @@ using namespace amrex;
 
 namespace derive_functions
 {
+  void dermagvel (const Box& bx, FArrayBox& derfab, int dcomp, int ncomp,
+          const FArrayBox& datfab, const Geometry& /*geomdata*/,
+          Real /*time*/, const int* /*bcrec*/, int /*level*/)
+  {
+    AMREX_ASSERT(derfab.box().contains(bx));
+    AMREX_ASSERT(datfab.box().contains(bx));
+    AMREX_ASSERT(derfab.nComp() >= dcomp + ncomp);
+    AMREX_ASSERT(datfab.nComp() >= AMREX_SPACEDIM);
+    AMREX_ASSERT(ncomp == 1);
+
+    const auto vel = datfab.const_array();
+    const auto mag = derfab.array(dcomp);
+
+    amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+    {
+      amrex::Real mag_sq = vel(i,j,k,0) * vel(i,j,k,0)
+                         + vel(i,j,k,1) * vel(i,j,k,1);
+#if (AMREX_SPACEDIM == 3)
+      mag_sq += vel(i,j,k,2) * vel(i,j,k,2);
+#endif
+      mag(i,j,k) = std::sqrt(mag_sq);
+    });
+  }
+
   void der_vel_avg (const Box& bx, FArrayBox& derfab, int dcomp, int ncomp,
             const FArrayBox& datfab, const Geometry& /*geomdata*/,
             Real /*time*/, const int* /*bcrec*/, int level)

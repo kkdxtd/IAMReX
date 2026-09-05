@@ -22,3 +22,25 @@ xml
 .cache
 .idea
 build
+
+# Generated simulation data and build products (keep inputs and source files).
+plt[0-9]*/
+chk[0-9]*/
+fin_vtk/
+fin_[0-9]*.vtk
+IB_Fin_*.csv
+IB_Fiber_*.csv
+IB_Particle_*.csv
+Fiber_LagrangianPoints_*.csv
+fiber[0-9]*
+particle[0-9]*
+force-list/
+*.exe
+*.obj
+*.mod
+*.smod
+*.pdb
+*.ilk
+*.log
+__pycache__/
+*.pyc

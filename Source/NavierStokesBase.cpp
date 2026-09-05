@@ -22,7 +22,9 @@
 #include <hydro_utils.H>
 
 #ifdef AMREX_PARTICLES
-#ifdef PARTICLE_PARALLEL
+#if (AMREX_SPACEDIM == 2)
+#include "DiffusedFiber.H"
+#elif defined(PARTICLE_PARALLEL)
 #include "DiffusedIB_Parallel.H"
 #else
 #include "DiffusedIB.H"
@@ -364,6 +366,17 @@ void NavierStokesBase::define_workspace()
         phi_nodal.define(nba,dmap,1,2,MFInfo(),Factory());
         pvf.define(grids,dmap,1,2,MFInfo(),Factory());
 #ifdef AMREX_PARTICLES
+#if (AMREX_SPACEDIM == 2)
+        phi_nodal.setVal(1.0);
+        pvf.setVal(0.0);
+        if (level == Fibers::FiberFinestLevel()) {
+            if (!Fibers::isInitial) {
+                Fibers::init_fiber(gravity, geom.CellSizeArray()[0]);
+            }
+            Fibers::get_fibers()->UpdateGeometry(state[State_Type].curTime());
+            Fibers::create_fibers(geom, dmap, grids);
+        }
+#else
         amrex::Print() << "check level " << level << " " << Particles::ParticleFinestLevel() << std::endl;
         if (level == Particles::ParticleFinestLevel()) {
             if(!Particles::isInitial){
@@ -373,6 +386,7 @@ void NavierStokesBase::define_workspace()
             //largra
             Particles::create_particles(geom, dmap, grids); // Class constructor
         }
+#endif
 #endif
     }
 
@@ -696,7 +710,13 @@ NavierStokesBase::Initialize ()
     amrex::ExecOnFinalize(NavierStokesBase::Finalize);
 
 #ifdef AMREX_PARTICLES
-    Particles::Initialize();
+    if (do_diffused_ib) {
+#if (AMREX_SPACEDIM == 2)
+        Fibers::Initialize();
+#else
+        Particles::Initialize();
+#endif
+    }
 #endif
 
     initialized = true;
@@ -2898,8 +2918,8 @@ NavierStokesBase::restart (Amr&          papa,
       computeGradP(state[Press_Type].prevTime());
     }
 
-#ifdef AMREX_PARTICLES
-    if(level == Particles::ParticleFinestLevel())
+#if defined(AMREX_PARTICLES) && (AMREX_SPACEDIM == 3)
+    if (do_diffused_ib && level == Particles::ParticleFinestLevel())
     {
         Particles::Restart(gravity, geom.CellSizeArray()[0],parent->levelSteps(0));
         ParallelDescriptor::Barrier();
