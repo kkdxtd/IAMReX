@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2026 IAMReX contributors
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Python-side runtime configuration for the RKPM weight tool.
+# Relative paths are resolved from this file's directory.
+
+solver = rkpm
+transport = mpmd
+# Number of markers evaluated in each vectorized solver batch.
+batch_size = 4096
+# PyTorch inference device for solver = ml: cpu, cuda, or auto.
+device = cpu
+
+# AMReX grid and geometry inputs.
+inputs = fixtures/real_case/inputs.3d.flow_past_ellipsoid
+geometry = none
+# For geometry generation, true means body-relative coordinates and false means
+# coordinates already in the AMReX world frame. Do not omit this selection when
+# geometry names a point-cloud file.
+body_frame = false
+angle = 0.0
+
+# Mapping input and file-mode output paths.
+id = fixtures/real_case/rkpm_mappings.id
+lag = fixtures/real_case/rkpm_mappings.lag
+output_prefix = fixtures/real_case/rkpm_mappings
+
+# Transolver files; these are loaded only when solver = ml.
+model_dir = ../../../Transolver_v2/out_inv
+model_code = ../../../Transolver_v2/transolver_slim.py
+
+# MPMD validation: off, warn, or abort.
+# The first exchange is checked, followed by every check_interval exchanges.
+check_action = warn
+check_interval = 1
+sum_tolerance = 1.0e-6
+moment_tolerance = 1.0e-6

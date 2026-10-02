@@ -15,6 +15,7 @@
 #include <iamr_constants.H>
 
 #include "DiffusedIB_Parallel.H"
+#include <AMReX_MPMD.H>
 
 #include <algorithm>
 #include <filesystem>
@@ -55,6 +56,8 @@ namespace ParticleProperties{
     int start_step{-1};
     int collision_model{0};
     int delta_type{1};
+    int reduce_method{0};  // 0 = original ReduceSum loop, 1 = ParticleReduce 6-tuple + packed all-reduce
+    int pvf_method{1};     // 0 = reference per-particle whole-domain phi/pvf path, 1 = bounding-box fused kernels + packed MPI
 
     int write_freq{1};
     bool init_particle_from_file{false};
@@ -154,9 +157,83 @@ Real nodal_phi_to_heavi(Real phi)
     return 1.0;
 }
 
+// Nodal level-set value of one particle at node (Xn,Yn,Zn). Same formulas as
+// calculate_phi_nodal(): sphere -> signed distance normalised by the radius,
+// ellipsoid -> first-order approximation left unnormalised, anything else -> 0.
+AMREX_INLINE AMREX_GPU_DEVICE
+Real nodal_phi_at (Real Xn, Real Yn, Real Zn,
+                   Real Xp, Real Yp, Real Zp,
+                   Real a, Real b, Real c, int geometry_type) noexcept
+{
+    if (geometry_type == 1) {
+        Real phi = std::sqrt( (Xn - Xp)*(Xn - Xp)
+                            + (Yn - Yp)*(Yn - Yp) + (Zn - Zp)*(Zn - Zp)) - a;
+        return phi / a;
+    } else if (geometry_type == 2) {
+        Real xp = Xn - Xp;
+        Real yp = Yn - Yp;
+        Real zp = Zn - Zp;
+        Real xp2 = xp * xp;
+        Real yp2 = yp * yp;
+        Real zp2 = zp * zp;
+        Real a2 = a * a;
+        Real b2 = b * b;
+        Real c2 = c * c;
+        Real numerator = (xp2 / a2 + yp2 / b2 + zp2 / c2) - 1.0;
+        Real xp4 = xp2 * xp2;
+        Real yp4 = yp2 * yp2;
+        Real zp4 = zp2 * zp2;
+        Real a4 = a2 * a2;
+        Real b4 = b2 * b2;
+        Real c4 = c2 * c2;
+        Real denominator = 2.0 * std::sqrt(xp4 / a4 + yp4 / b4 + zp4 / c4);
+        return numerator / (denominator + 1.e-12);
+    }
+    return 0.0;
+}
+
+// Volume fraction of cell (i,j,k) from the 8 analytic nodal values of one
+// particle. Same arithmetic (and summation order) as calculate_phi_nodal()
+// followed by nodal_phi_to_pvf(), without materialising phi_nodal.
+AMREX_INLINE AMREX_GPU_DEVICE
+Real cell_pvf_at (int i, int j, int k,
+                  GpuArray<Real,3> const& dx, GpuArray<Real,3> const& plo,
+                  Real Xp, Real Yp, Real Zp,
+                  Real a, Real b, Real c, int geometry_type) noexcept
+{
+    Real num = 0.0;
+    Real deo = 0.0;
+    for (int kk = k; kk <= k+1; ++kk) {
+        for (int jj = j; jj <= j+1; ++jj) {
+            for (int ii = i; ii <= i+1; ++ii) {
+                const Real ph = nodal_phi_at(ii * dx[0] + plo[0], jj * dx[1] + plo[1], kk * dx[2] + plo[2],
+                                             Xp, Yp, Zp, a, b, c, geometry_type);
+                num += (-ph) * nodal_phi_to_heavi(-ph);
+                deo += std::abs(ph);
+            }
+        }
+    }
+    return num / (deo + 1.e-12);
+}
+
+// Index-space box containing every cell whose pvf can be non-zero for a body
+// of extent R centred at loc: such a cell has a node strictly inside the body,
+// i.e. within R of the centre. One extra cell of margin on each side.
+Box particle_index_box (const RealVect& loc, Real R)
+{
+    const auto& dx  = ParticleProperties::dx;
+    const auto& plo = ParticleProperties::plo;
+    IntVect lo, hi;
+    for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+        lo[d] = static_cast<int>(std::floor((loc[d] - R - plo[d]) / dx[d])) - 1;
+        hi[d] = static_cast<int>(std::ceil ((loc[d] + R - plo[d]) / dx[d])) + 1;
+    }
+    return Box(lo, hi);
+}
+
 void nodal_phi_to_pvf(MultiFab& pvf, const MultiFab& phi_nodal)
 {
-
+    BL_PROFILE("DiffusedIB::nodal_phi_to_pvf");
     // Print() << "In the nodal_phi_to_pvf\n";
 
     pvf.setVal(0.0);
@@ -201,6 +278,7 @@ void nodal_phi_to_pvf(MultiFab& pvf, const MultiFab& phi_nodal)
 // approximation that is deliberately left unnormalised). Any other value aborts.
 void calculate_phi_nodal(MultiFab& phi_nodal, kernel& current_kernel)
 {
+    BL_PROFILE("DiffusedIB::calculate_phi_nodal");
     phi_nodal.setVal(0.0);
 
     Real Xp = current_kernel.location[0];
@@ -419,6 +497,8 @@ void mParticle::InteractWithEuler(MultiFab &EulerVel,
                                   MultiFab &EulerForce,
                                   Real dt)
 {
+    BL_PROFILE("mParticle::InteractWithEuler");
+    BL_PROFILE_VAR("mParticle::InteractWithEuler()", mParticle_InteractWithEuler);
     if (verbose) Print() << "[Particle] mParticle::InteractWithEuler\n";
     // clear time , start record
     spend_time = 0;
@@ -439,6 +519,7 @@ void mParticle::InteractWithEuler(MultiFab &EulerVel,
 
     // Sync kernel data to device memory for GPU ParallelFor
     syncKernelsToDevice();
+    RefreshRKPMWeights();
 
     BL_ASSERT(loop > 0);
     while(loop > 0){
@@ -457,7 +538,55 @@ void mParticle::InteractWithEuler(MultiFab &EulerVel,
         VelocityCorrection(EulerVel, EulerForce, dt);
         loop--;
     }
+    BL_PROFILE_VAR_STOP(mParticle_InteractWithEuler);
     spend_time += ParallelDescriptor::second() - InteractWithEulerStart;
+}
+
+void mParticle::RefreshRKPMWeights()
+{
+    if (!do_RKPM || !amrex::MPMD::Initialized() || m_mpmd_exchange_done) return;
+    // m_mpmd_exchange_done = true;
+
+    const int Nm = static_cast<int>(LargrangianMarker.size());
+    const int server_root = amrex::MPMD::NProcs() - 1;
+    const int nw = Nm * RKPM_STENCIL_SIZE;
+
+    Vector<float> h_w(nw);
+    if (ParallelDescriptor::MyProc() == ParallelDescriptor::IOProcessorNumber()) {
+        const Real t0 = ParallelDescriptor::second();
+        // send number of markers
+        MPI_Send(&Nm, 1, MPI_INT, server_root, 200, MPI_COMM_WORLD);
+        // send marker positions
+        Vector<double> h_pos(Nm * 3);
+        for (int i = 0; i < Nm; ++i) {
+            h_pos[3*i+0] = static_cast<double>(LargrangianMarker[i][0]);
+            h_pos[3*i+1] = static_cast<double>(LargrangianMarker[i][1]);
+            h_pos[3*i+2] = static_cast<double>(LargrangianMarker[i][2]);
+        }
+        MPI_Send(h_pos.data(), Nm*3, MPI_DOUBLE, server_root, 201, MPI_COMM_WORLD);
+        // receive weights
+        MPI_Recv(h_w.data(), nw, MPI_FLOAT, server_root, 202, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        const Real t1 = ParallelDescriptor::second();
+        double s = 0.0;
+        for (int i = 0; i < nw; ++i) s += h_w[i];
+        Print() << "[RKPM-MPMD] received " << Nm << " markers, sum=" << s
+                << ", recv-send time (ML inference included)=" << (t1 - t0) << " s\n";
+    }
+
+    // broadcast weights to all procs
+    ParallelDescriptor::Bcast(h_w.data(), nw, ParallelDescriptor::IOProcessorNumber());
+
+    // copy to device weight
+    AMREX_ALWAYS_ASSERT(h_rkpm_flat.size() == static_cast<size_t>(nw));
+    for (int i = 0; i < nw; ++i) {
+        h_rkpm_flat[i].weight = static_cast<Real>(h_w[i]);
+    }
+    Gpu::copyAsync(Gpu::hostToDevice, h_rkpm_flat.begin(), h_rkpm_flat.end(), d_rkpm_flat.begin());
+    Gpu::streamSynchronize();
+
+    if (ParallelDescriptor::MyProc() == ParallelDescriptor::IOProcessorNumber()) {
+        Print() << "[RKPM-MPMD] wrote " << nw << " weights to d_rkpm_flat\n";
+    }
 }
 
 void mParticle::InitParticles(const Vector<Real>& x,
@@ -705,6 +834,7 @@ void mParticle::syncKernelsToDevice ()
 }
 
 void mParticle::UpdateLagrangianMarker() {
+    BL_PROFILE("mParticle::UpdateLagrangianMarker");
     if (verbose) Print() << "\tmParticle::UpdateLagrangianMarker\n";
     // update lagrangian marker attributions
     for (mParIter pti(*mContainer, LOCAL_LEVEL); pti.isValid(); ++pti) {
@@ -745,9 +875,10 @@ void mParticle::UpdateLagrangianMarker() {
                         particles[i].pos(1) = state.y;
                         particles[i].pos(2) = state.z;
                     } else {
-                        particles[i].pos(0) = location[0] + radius * std::sin(thetaK[m_id - start_id]) * std::cos(phiK[m_id - start_id]);
-                        particles[i].pos(1) = location[1] + radius * std::sin(thetaK[m_id - start_id]) * std::sin(phiK[m_id - start_id]);
-                        particles[i].pos(2) = location[2] + radius * std::cos(thetaK[m_id - start_id]);
+                        const auto ia = m_id - start_id - 1;
+                        particles[i].pos(0) = location[0] + radius * std::sin(thetaK[ia]) * std::cos(phiK[ia]);
+                        particles[i].pos(1) = location[1] + radius * std::sin(thetaK[ia]) * std::sin(phiK[ia]);
+                        particles[i].pos(2) = location[2] + radius * std::cos(thetaK[ia]);
                     }
                 }
                 // RKPM forbi
@@ -764,12 +895,35 @@ void mParticle::UpdateLagrangianMarker() {
         );
     }
     // https://amrex-codes.github.io/amrex/docs_html/Particle.html#redistribute
-    mContainer->Redistribute();
+    // Rigid markers need redistribution when a centre moves. Prescribed fins
+    // also need it as their surfaces deform around a fixed origin.
+    if (MarkersNeedRedistribute()) {
+        mContainer->Redistribute();
+    }
 
     if (verbose) {
         Print() << "[particle] : particle num :" << mContainer->TotalNumberOfParticles() << "\n";
         // mContainer->WriteAsciiFile(Concatenate("particle", 1));
     }
+}
+
+// Redistribute deforming fins, moved rigid bodies, and newly created markers.
+// Remember the current centres for the rigid-body fast path.
+bool mParticle::MarkersNeedRedistribute()
+{
+    const int nk = static_cast<int>(particle_kernels.size());
+    // A prescribed fin deforms even when its origin stays fixed.
+    bool moved = (static_cast<int>(m_redistributed_loc.size()) != nk)
+              || std::any_of(particle_kernels.begin(), particle_kernels.end(),
+                  [](const kernel& body) { return is_prescribed_fin(body.geometry_type); });
+    for (int k = 0; !moved && k < nk; ++k) {
+        moved = (particle_kernels[k].location != m_redistributed_loc[k]);
+    }
+    if (moved) {
+        m_redistributed_loc.resize(nk);
+        for (int k = 0; k < nk; ++k) m_redistributed_loc[k] = particle_kernels[k].location;
+    }
+    return moved;
 }
 
 template <typename P = Particle<num_Real, num_Int>>
@@ -854,6 +1008,7 @@ void VelocityInterpolationRKPM_cir(
 void mParticle::VelocityInterpolation(MultiFab &EulerVel,
                                       int type)//
 {
+    BL_PROFILE("mParticle::VelocityInterpolation");
     if (verbose) Print() << "\tmParticle::VelocityInterpolation\n";
 
     //Print() << "euler_finest_level " << euler_finest_level << std::endl;
@@ -903,7 +1058,7 @@ void mParticle::VelocityInterpolation(MultiFab &EulerVel,
 
 void mParticle::ComputeLagrangianForce(Real dt)
 {
-
+    BL_PROFILE("mParticle::ComputeLagrangianForce");
     if (verbose) Print() << "\tmParticle::ComputeLagrangianForce\n";
 
     for(mParIter pti( *mContainer, LOCAL_LEVEL); pti.isValid(); ++pti){
@@ -1069,6 +1224,7 @@ void ForceSpreadingRKPM_cir(
 void mParticle::ForceSpreading(MultiFab & EulerForce,
                                int type)
 {
+    BL_PROFILE("mParticle::ForceSpreading");
     if (verbose) Print() << "\tmParticle::ForceSpreading\n";
     const auto& gm = mContainer->GetParGDB()->Geom(LOCAL_LEVEL);
     auto plo = gm.ProbLoArray();
@@ -1122,114 +1278,146 @@ void mParticle::ForceSpreading(MultiFab & EulerForce,
             });
         }
     }
-    //barrier for sync;
-    ParallelDescriptor::Barrier();
-
     using pc = mParticleContainer::SuperParticleType;
     // particle id => thread id
+    BL_PROFILE_VAR("ForceSpreading::reduce_per_particle", blp_fsreduce);
 
-    for (auto& cur_p : particle_kernels) { // gm position
-        // https://github.com/AMReX-Codes/amrex/discussions/4593
-        // ReduceOps<ReduceOpSum, ReduceOpSum, ReduceOpSum, ReduceOpSum, ReduceOpSum, ReduceOpSum> reduce_ops;
-        // auto r = ParticleReduce<ReduceData<Real, Real, Real, Real, Real, Real>> (
-        //     *mContainer, [=] AMREX_GPU_DEVICE (const pc& p) -> GpuTuple<Real, Real, Real, Real, Real, Real> {
-        //         if (p.idata(M_ID) == cur_p.id) {
-        //             return {
-        //                 p.rdata(P_ATTR_REAL::Fx_Marker),
-        //                 p.rdata(P_ATTR_REAL::Fy_Marker),
-        //                 p.rdata(P_ATTR_REAL::Fz_Marker),
-        //                 p.rdata(P_ATTR_REAL::Mx_Marker),
-        //                 p.rdata(P_ATTR_REAL::My_Marker),
-        //                 p.rdata(P_ATTR_REAL::Mz_Marker)
-        //             };
-        //         }
-        //     return {0,0,0,0,0,0};
-        //     }, reduce_ops
-        // );
-        //
-        // auto fx = get<0>(r);
-        // auto fy = get<1>(r);
-        // auto fz = get<2>(r);
-        // auto mx = get<3>(r);
-        // auto my = get<4>(r);
-        // auto mz = get<5>(r);
+    if (ParticleProperties::reduce_method == 1) {
+        static bool printed_once = false;
+        if (!printed_once) {
+            printed_once = true;
+            amrex::Print() << "[Particle] : reduce_method = 1 : optimized ParticleReduce (6-tuple) + packed all-reduce in use\n";
+        }
+        // ===== optimized: one 6-tuple ParticleReduce per kernel (1 scan per
+        // ===== particle instead of 6), then one packed MPI all-reduce (6N -> 1).
+        // Note: ParticleReduce returns per-rank partial sums only, so the packed
+        // all-reduce below is required. See https://github.com/AMReX-Codes/amrex/discussions/4593
+        const int nkern = particle_kernels.size();
+        Vector<Real> ib_fm(6 * nkern, 0.0);
+        // ===== optimized v2: single pass over all local markers with atomicAdd
+        // ===== into a 6*nkern device accumulator (one scan instead of nkern
+        // ===== full ParticleReduce scans), then one packed MPI all-reduce.
+        amrex::Gpu::DeviceVector<Real> d_ib_fm(6 * nkern, 0.0);
+        auto* d_ptr = d_ib_fm.data();
 
-        auto fx = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::Fx_Marker);
-            }
-            return 0.;
-        });
-        auto fy = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::Fy_Marker);
-            }
-            return 0.;
-        });
-        auto fz = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::Fz_Marker);
-            }
-            return 0.;
-        });
-        auto mx = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::Mx_Marker);
-            }
-            return 0.;
-        });
-        auto my = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::My_Marker);
-            }
-            return 0.;
-        });
-        auto mz = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
-            if (p.idata(M_ID) == cur_p.id) {
-                return p.rdata(P_ATTR_REAL::Mz_Marker);
-            }
-            return 0.;
-        });
+        for (mParIter pti(*mContainer, LOCAL_LEVEL); pti.isValid(); ++pti) {
+            // M_ID lives in the SoA int data (the AoS type here is Particle<0,0>
+            // and has no idata), so read the kernel id through GetIDs() like the
+            // spreading loop above does.
+            const auto *const ids = pti.GetIDs().data();
+            auto& attri = pti.GetAttribs();
+            const Long np = pti.numParticles();
+            const auto *const fxP_ptr = attri[P_ATTR_REAL::Fx_Marker].data();
+            const auto *const fyP_ptr = attri[P_ATTR_REAL::Fy_Marker].data();
+            const auto *const fzP_ptr = attri[P_ATTR_REAL::Fz_Marker].data();
+            const auto *const mxP_ptr = attri[P_ATTR_REAL::Mx_Marker].data();
+            const auto *const myP_ptr = attri[P_ATTR_REAL::My_Marker].data();
+            const auto *const mzP_ptr = attri[P_ATTR_REAL::Mz_Marker].data();
 
-        ParallelAllReduce::Sum(fx, ParallelDescriptor::Communicator());
-        ParallelAllReduce::Sum(fy, ParallelDescriptor::Communicator());
-        ParallelAllReduce::Sum(fz, ParallelDescriptor::Communicator());
-        ParallelAllReduce::Sum(mx, ParallelDescriptor::Communicator());
-        ParallelAllReduce::Sum(my, ParallelDescriptor::Communicator());
-        ParallelAllReduce::Sum(mz, ParallelDescriptor::Communicator());
-
-        cur_p.ib_force += {Real(fx), Real(fy), Real(fz)};
-        cur_p.ib_moment += {Real(mx), Real(my), Real(mz)};
+            ParallelFor(np,
+                [=] AMREX_GPU_DEVICE (const int i) noexcept {
+                    // M_ID equals the kernel index (0..nkern-1); Particle_id[M_ID] = cur_p.id
+                    const int pid = ids[i];
+                    const Long base = 6 * pid;
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 0, fxP_ptr[i]);
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 1, fyP_ptr[i]);
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 2, fzP_ptr[i]);
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 3, mxP_ptr[i]);
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 4, myP_ptr[i]);
+                    amrex::Gpu::Atomic::Add(d_ptr + base + 5, mzP_ptr[i]);
+                }
+            );
+        }
+        Gpu::copyAsync(Gpu::deviceToHost, d_ib_fm.begin(), d_ib_fm.end(), ib_fm.begin());
+        Gpu::streamSynchronize();
+        ParallelAllReduce::Sum(ib_fm.data(), ib_fm.size(), ParallelDescriptor::Communicator());
+        for (int k = 0; k < nkern; ++k) {
+            particle_kernels[k].ib_force  += {ib_fm[6*k+0], ib_fm[6*k+1], ib_fm[6*k+2]};
+            particle_kernels[k].ib_moment += {ib_fm[6*k+3], ib_fm[6*k+4], ib_fm[6*k+5]};
+        }
     }
+    else
+    {
+        static bool printed_once = false;
+        if (!printed_once) {
+            printed_once = true;
+            amrex::Print() << "[Particle] : reduce_method = 0 : original ReduceSum loop in use\n";
+        }
+        // ===== original: 6 ReduceSum + 6 ParallelAllReduce per kernel =====
+        for (auto& cur_p : particle_kernels) { // gm position
+            auto fx = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::Fx_Marker);
+                }
+                return 0.;
+            });
+            auto fy = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::Fy_Marker);
+                }
+                return 0.;
+            });
+            auto fz = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::Fz_Marker);
+                }
+                return 0.;
+            });
+            auto mx = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::Mx_Marker);
+                }
+                return 0.;
+            });
+            auto my = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::My_Marker);
+                }
+                return 0.;
+            });
+            auto mz = ReduceSum(*mContainer, [=] AMREX_GPU_HOST_DEVICE(const pc& p) -> ParticleReal{
+                if (p.idata(M_ID) == cur_p.id) {
+                    return p.rdata(P_ATTR_REAL::Mz_Marker);
+                }
+                return 0.;
+            });
 
+            ParallelAllReduce::Sum(fx, ParallelDescriptor::Communicator());
+            ParallelAllReduce::Sum(fy, ParallelDescriptor::Communicator());
+            ParallelAllReduce::Sum(fz, ParallelDescriptor::Communicator());
+            ParallelAllReduce::Sum(mx, ParallelDescriptor::Communicator());
+            ParallelAllReduce::Sum(my, ParallelDescriptor::Communicator());
+            ParallelAllReduce::Sum(mz, ParallelDescriptor::Communicator());
+
+            cur_p.ib_force += {Real(fx), Real(fy), Real(fz)};
+            cur_p.ib_moment += {Real(mx), Real(my), Real(mz)};
+        }
+    }
+    BL_PROFILE_VAR_STOP(blp_fsreduce);
     EulerForce.SumBoundary(ParticleProperties::euler_force_index, 3, gm.periodicity());
 }
 
 void mParticle::VelocityCorrection(MultiFab &Euler, MultiFab &EulerForce, Real dt) const
 {
+    BL_PROFILE("mParticle::VelocityCorrection");
     if(verbose) Print() << "\tmParticle::VelocityCorrection\n";
     MultiFab::Saxpy(Euler, dt, EulerForce, ParticleProperties::euler_force_index, ParticleProperties::euler_velocity_index, 3, 0); //VelocityCorrection
 }
 
-void mParticle::UpdateParticles(int iStep,
-                                Real time,
-                                const MultiFab& Euler_old,
-                                const MultiFab& Euler,
-                                MultiFab& phi_nodal,
-                                MultiFab& pvf,
-                                Real dt)
+// pvf_method = 0 : reference implementation. For every particle the nodal level
+// set and the pvf are evaluated on the whole domain, the momentum sums are
+// reduced over the whole domain, and one set of MPI collectives is issued per
+// particle. Cost per step ~ N_particle x domain.
+void mParticle::UpdateParticlesReference(int iStep,
+                                         const MultiFab& Euler_old,
+                                         const MultiFab& Euler,
+                                         MultiFab& phi_nodal,
+                                         MultiFab& pvf,
+                                         Real dt)
 {
-    if (verbose) Print() << "mParticle::UpdateParticles\n";
-    ib_time = time + dt;
-    // start record
-    auto UpdateParticlesStart = ParallelDescriptor::second();
-
-    //Particle Collision calculation
-    DoParticleCollision(ParticleProperties::collision_model);
-
     MultiFab AllParticlePVF(pvf.boxArray(), pvf.DistributionMap(), pvf.nComp(), pvf.nGrow());
     AllParticlePVF.setVal(0.0);
-
+    BL_PROFILE_VAR("UpdateParticles::phi_pvf_per_particle", blp_phipvf);
     //continue condition 6DOF
     for(auto& kernel : particle_kernels){
 
@@ -1267,63 +1455,8 @@ void mParticle::UpdateParticles(int iStep,
                 ParallelAllReduce::Sum(kernel.sum_t_new.dataPtr(), 3, ParallelDescriptor::Communicator());
                 ParallelAllReduce::Sum(kernel.sum_t_old.dataPtr(), 3, ParallelDescriptor::Communicator());
 
-            // 6DOF
-            if(ParallelDescriptor::MyProc() == ParallelDescriptor::IOProcessorNumber()){
-
-                for(auto idir : {0,1,2})
-                {
-                    //TL
-                    if (kernel.TL[idir] == 0) {
-                        kernel.velocity[idir] = 0.0;
-                    }
-                    else if (kernel.TL[idir] == 1) {
-                        kernel.location[idir] = kernel.location_old[idir] + (kernel.velocity[idir] + kernel.velocity_old[idir]) * dt * 0.5;
-                    }
-                    else if (kernel.TL[idir] == 2) {
-                        if(!ParticleProperties::Uhlmann){
-                            kernel.velocity[idir] = kernel.velocity_old[idir]
-                                                + ((kernel.sum_u_new[idir] - kernel.sum_u_old[idir]) * ParticleProperties::euler_fluid_rho / dt
-                                                - kernel.ib_force[idir] * ParticleProperties::euler_fluid_rho
-                                                + m_gravity[idir] * (kernel.rho - ParticleProperties::euler_fluid_rho) * kernel.Vp
-                                                + kernel.Fcp[idir]) * dt / kernel.rho / kernel.Vp ;
-                        }else{
-                            //Uhlmann
-                            kernel.velocity[idir] = kernel.velocity_old[idir]
-                                                + (ParticleProperties::euler_fluid_rho / kernel.Vp /(ParticleProperties::euler_fluid_rho - kernel.rho)*kernel.ib_force[idir]
-                                                + m_gravity[idir]) * dt;
-                        }
-                        kernel.location[idir] = kernel.location_old[idir] + (kernel.velocity[idir] + kernel.velocity_old[idir]) * dt * 0.5;
-                    }
-                    else {
-                        Print() << "Particle (" << kernel.id << ") has wrong TL"<< direction_str[idir] <<" value\n";
-                        Abort("Stop here!");
-                    }
-                    //RL
-                    if (kernel.RL[idir] == 0) {
-                        kernel.omega[idir] = 0.0;
-                    }
-                    else if (kernel.RL[idir] == 1) {
-                    }
-                    else if (kernel.RL[idir] == 2) {
-                        if(!ParticleProperties::Uhlmann){
-                            kernel.omega[idir] = kernel.omega_old[idir]
-                                            + ((kernel.sum_t_new[idir] - kernel.sum_t_old[idir]) * ParticleProperties::euler_fluid_rho / dt
-                                            - kernel.ib_moment[idir] * ParticleProperties::euler_fluid_rho
-                                            + kernel.Tcp[idir]) * dt / cal_momentum(kernel.rho, kernel.radius, kernel.geometry_type, idir, kernel.radius2, kernel.radius3);
-                        }else{
-                            //Uhlmann
-                            kernel.omega[idir] = kernel.omega_old[idir]
-                                            + ParticleProperties::euler_fluid_rho /(ParticleProperties::euler_fluid_rho - kernel.rho) * kernel.ib_moment[idir] * kernel.dv
-                                            / cal_momentum(kernel.rho, kernel.radius, kernel.geometry_type, idir, kernel.radius2, kernel.radius3) * kernel.rho * dt;
-                        }
-                    }
-                    else {
-                        Print() << "Particle (" << kernel.id << ") has wrong RL"<< direction_str[idir] <<" value\n";
-                        Abort("Stop here!");
-                    }
-
-                }
-            }
+            // 6DOF (I/O rank only), then broadcast the new state
+            SixDOFUpdate(kernel, dt);
             ParallelDescriptor::Bcast(&kernel.location[0],3,ParallelDescriptor::IOProcessorNumber());
             ParallelDescriptor::Bcast(&kernel.location_old[0],3,ParallelDescriptor::IOProcessorNumber());
             ParallelDescriptor::Bcast(&kernel.velocity[0],3,ParallelDescriptor::IOProcessorNumber());
@@ -1343,20 +1476,350 @@ void mParticle::UpdateParticles(int iStep,
         RecordOldValue(kernel);
         MultiFab::Add(AllParticlePVF, pvf, 0, 0, 1, 0); // do not copy ghost cell values
     }
+    BL_PROFILE_VAR_STOP(blp_phipvf);
     // calculate the pvf based on the information of all particles
     MultiFab::Copy(pvf, AllParticlePVF, 0, 0, 1, pvf.nGrow());
+}
 
+// 6DOF update of one particle from its momentum sums, IB force/moment and
+// collision force. Only the I/O rank computes; callers broadcast afterwards.
+void mParticle::SixDOFUpdate(kernel& kernel, Real dt)
+{
+    if (is_prescribed_fin(kernel.geometry_type)) return;
+    if (ParallelDescriptor::MyProc() != ParallelDescriptor::IOProcessorNumber()) return;
+
+    for(auto idir : {0,1,2})
+    {
+        //TL
+        if (kernel.TL[idir] == 0) {
+            kernel.velocity[idir] = 0.0;
+        }
+        else if (kernel.TL[idir] == 1) {
+            kernel.location[idir] = kernel.location_old[idir] + (kernel.velocity[idir] + kernel.velocity_old[idir]) * dt * 0.5;
+        }
+        else if (kernel.TL[idir] == 2) {
+            if(!ParticleProperties::Uhlmann){
+                kernel.velocity[idir] = kernel.velocity_old[idir]
+                                    + ((kernel.sum_u_new[idir] - kernel.sum_u_old[idir]) * ParticleProperties::euler_fluid_rho / dt
+                                    - kernel.ib_force[idir] * ParticleProperties::euler_fluid_rho
+                                    + m_gravity[idir] * (kernel.rho - ParticleProperties::euler_fluid_rho) * kernel.Vp
+                                    + kernel.Fcp[idir]) * dt / kernel.rho / kernel.Vp ;
+            }else{
+                //Uhlmann
+                kernel.velocity[idir] = kernel.velocity_old[idir]
+                                    + (ParticleProperties::euler_fluid_rho / kernel.Vp /(ParticleProperties::euler_fluid_rho - kernel.rho)*kernel.ib_force[idir]
+                                    + m_gravity[idir]) * dt;
+            }
+            kernel.location[idir] = kernel.location_old[idir] + (kernel.velocity[idir] + kernel.velocity_old[idir]) * dt * 0.5;
+        }
+        else {
+            Print() << "Particle (" << kernel.id << ") has wrong TL"<< direction_str[idir] <<" value\n";
+            Abort("Stop here!");
+        }
+        //RL
+        if (kernel.RL[idir] == 0) {
+            kernel.omega[idir] = 0.0;
+        }
+        else if (kernel.RL[idir] == 1) {
+        }
+        else if (kernel.RL[idir] == 2) {
+            if(!ParticleProperties::Uhlmann){
+                kernel.omega[idir] = kernel.omega_old[idir]
+                                + ((kernel.sum_t_new[idir] - kernel.sum_t_old[idir]) * ParticleProperties::euler_fluid_rho / dt
+                                - kernel.ib_moment[idir] * ParticleProperties::euler_fluid_rho
+                                + kernel.Tcp[idir]) * dt / cal_momentum(kernel.rho, kernel.radius, kernel.geometry_type, idir, kernel.radius2, kernel.radius3);
+            }else{
+                //Uhlmann
+                kernel.omega[idir] = kernel.omega_old[idir]
+                                + ParticleProperties::euler_fluid_rho /(ParticleProperties::euler_fluid_rho - kernel.rho) * kernel.ib_moment[idir] * kernel.dv
+                                / cal_momentum(kernel.rho, kernel.radius, kernel.geometry_type, idir, kernel.radius2, kernel.radius3) * kernel.rho * dt;
+            }
+        }
+        else {
+            Print() << "Particle (" << kernel.id << ") has wrong RL"<< direction_str[idir] <<" value\n";
+            Abort("Stop here!");
+        }
+    }
+}
+
+// Broadcast location/velocity/omega (+ their *_old) of all particles from the
+// I/O rank in one message instead of 6 broadcasts per particle.
+void mParticle::BroadcastKernelState()
+{
+    const int nk = static_cast<int>(particle_kernels.size());
+    constexpr int NV = 18;
+    Vector<Real> buf(NV * nk);
+    if (ParallelDescriptor::MyProc() == ParallelDescriptor::IOProcessorNumber()) {
+        for (int k = 0; k < nk; ++k) {
+            auto const& p = particle_kernels[k];
+            Real* b = buf.data() + NV * k;
+            for (int d = 0; d < 3; ++d) {
+                b[d]      = p.location[d];
+                b[3 + d]  = p.location_old[d];
+                b[6 + d]  = p.velocity[d];
+                b[9 + d]  = p.velocity_old[d];
+                b[12 + d] = p.omega[d];
+                b[15 + d] = p.omega_old[d];
+            }
+        }
+    }
+    ParallelDescriptor::Bcast(buf.data(), buf.size(), ParallelDescriptor::IOProcessorNumber());
+    for (int k = 0; k < nk; ++k) {
+        auto& p = particle_kernels[k];
+        const Real* b = buf.data() + NV * k;
+        for (int d = 0; d < 3; ++d) {
+            p.location[d]     = b[d];
+            p.location_old[d] = b[3 + d];
+            p.velocity[d]     = b[6 + d];
+            p.velocity_old[d] = b[9 + d];
+            p.omega[d]        = b[12 + d];
+            p.omega_old[d]    = b[15 + d];
+        }
+    }
+}
+
+// (particle, local grid, intersection box) list for the pvf kernels: every
+// cell of grid `grid` in `ibx` may carry a non-zero pvf of particle `kidx`
+// evaluated at loc[kidx] (and loc_old[kidx] when that differs). Cached and
+// reused as long as the centres and the grids are unchanged.
+const Vector<mParticle::PvfWork>&
+mParticle::PvfWorkList(const BoxArray& ba, const DistributionMapping& dm,
+                       const Vector<RealVect>& loc, const Vector<RealVect>& loc_old)
+{
+    if (loc == m_pvf_work_loc && loc_old == m_pvf_work_loc_old && ba == m_pvf_work_ba) {
+        return m_pvf_work;
+    }
+    m_pvf_work.clear();
+    const int myproc = ParallelDescriptor::MyProc();
+    const int nk = static_cast<int>(loc.size());
+    for (int k = 0; k < nk; ++k) {
+        auto const& kern = particle_kernels[k];
+        // Open fin surfaces have no closed-body volume fraction.
+        if (is_prescribed_fin(kern.geometry_type)) continue;
+        const Real R = (kern.geometry_type == 2)
+                     ? amrex::max(kern.radius, amrex::max(kern.radius2, kern.radius3)) : kern.radius;
+        Box bbox = particle_index_box(loc[k], R);
+        if (loc_old[k] != loc[k]) bbox.minBox(particle_index_box(loc_old[k], R));
+        for (auto const& is : ba.intersections(bbox)) {
+            if (dm[is.first] == myproc) m_pvf_work.push_back({k, is.first, is.second});
+        }
+    }
+    m_pvf_work_loc = loc;
+    m_pvf_work_loc_old = loc_old;
+    m_pvf_work_ba = ba;
+    return m_pvf_work;
+}
+
+// pvf_method = 1 : same numerics as UpdateParticlesReference(), but
+//  * every particle only touches the cells of its own bounding box (pvf is
+//    exactly zero elsewhere), phi_nodal / pvf_old are never materialised, and
+//    the pvf evaluation and the momentum sums are fused into one small kernel
+//    per (particle, box) pair;
+//  * all MPI traffic of one 6DOF iteration is one packed all-reduce (12 sums
+//    per particle) plus one packed broadcast of the particle state.
+// The per-step cost is therefore ~ (local particles) x (cells per particle)
+// instead of N_particle x domain, which is what weak scaling needs.
+void mParticle::UpdateParticlesFused(int iStep,
+                                     const MultiFab& Euler_old,
+                                     const MultiFab& Euler,
+                                     MultiFab& pvf,
+                                     Real dt)
+{
+    const int nk = static_cast<int>(particle_kernels.size());
+    const auto dx  = ParticleProperties::dx;
+    const auto plo = ParticleProperties::plo;
+    const Real dvol = Math::powi<3>(dx[0]);
+    const int vidx = ParticleProperties::euler_velocity_index;
+
+    for (auto const& kern : particle_kernels) {
+        if (kern.geometry_type > 2 && !is_prescribed_fin(kern.geometry_type)) {
+            Print() << "Particle (" << kern.id << ") has unsupported geometry_type: " << kern.geometry_type << "\n";
+            Abort("Unsupported geometry type. Only geometry_type = 1 (sphere) and 2 (ellipsoid) are supported.");
+        }
+    }
+
+    // The reference path copies pvf into pvf_old right after entering the
+    // function, so the "old" sums always use the pvf at the entry location.
+    // loc_pvf tracks where the most recent pvf was evaluated; the final
+    // accumulation into pvf uses it (see the reference path).
+    Vector<RealVect> loc_entry(nk), loc_pvf(nk);
+    for (int k = 0; k < nk; ++k) {
+        loc_entry[k] = particle_kernels[k].location;
+        loc_pvf[k]   = particle_kernels[k].location;
+    }
+
+    // 12 partial sums per particle: sum_u_new, sum_u_old, sum_t_new, sum_t_old
+    constexpr int NS = 12;
+    Gpu::DeviceVector<Real> d_sums(NS * nk);
+    Vector<Real> h_sums(NS * nk);
+    Real* const d_sums_ptr = d_sums.data();
+
+    BL_PROFILE_VAR("UpdateParticles::phi_pvf_per_particle", blp_phipvf);
+    int loop = ParticleProperties::loop_solid;
+    while (loop > 0 && iStep > ParticleProperties::start_step) {
+
+        // ---- local sums on the GPU: one small kernel per (particle, box) ----
+        BL_PROFILE_VAR("UpdateParticles::pvf_sums_local", blp_local);
+        ParallelFor(NS * nk, [=] AMREX_GPU_DEVICE (int i) noexcept { d_sums_ptr[i] = 0.0; });
+
+        for (int kidx = 0; kidx < nk; ++kidx) loc_pvf[kidx] = particle_kernels[kidx].location;
+        // (particle, local grid, intersection box) triples of this rank only:
+        // no MFIter per particle, and nothing at all for particles that live
+        // on other ranks, so the host cost is ~ local particles, not N_total.
+        auto const& work = PvfWorkList(Euler.boxArray(), Euler.DistributionMap(), loc_pvf, loc_entry);
+        for (auto const& w : work) {
+            const int kidx = w.kidx;
+            auto const& kern = particle_kernels[kidx];
+            const RealVect loc_c = kern.location;   // current pvf and torque arm
+            const RealVect loc_e = loc_entry[kidx]; // "old" pvf
+            const bool same_loc = (loc_c == loc_e);
+            const Real a = kern.radius;
+            const Real b = kern.radius2;
+            const Real c = kern.radius3;
+            const int  gtype = kern.geometry_type;
+            Real* const sums = d_sums_ptr + NS * kidx;
+            {
+                const Box ibx = w.ibx;
+                auto const& En = Euler.const_array(w.grid);
+                auto const& Eo = Euler_old.const_array(w.grid);
+                ParallelFor(ibx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+                {
+                    const Real pvf_c = cell_pvf_at(i, j, k, dx, plo, loc_c[0], loc_c[1], loc_c[2], a, b, c, gtype);
+                    const Real pvf_e = same_loc ? pvf_c
+                                     : cell_pvf_at(i, j, k, dx, plo, loc_e[0], loc_e[1], loc_e[2], a, b, c, gtype);
+                    if (pvf_c == 0.0 && pvf_e == 0.0) return;
+
+                    // same expressions as CalculateSumU_cir / CalculateSumT_cir
+                    Real x = plo[0] + i*dx[0] + 0.5*dx[0];
+                    Real y = plo[1] + j*dx[1] + 0.5*dx[1];
+                    Real z = plo[2] + k*dx[2] + 0.5*dx[2];
+                    const RealVect r(x - loc_c[0], y - loc_c[1], z - loc_c[2]);
+                    const RealVect vn(En(i,j,k,vidx), En(i,j,k,vidx+1), En(i,j,k,vidx+2));
+                    const RealVect vo(Eo(i,j,k,vidx), Eo(i,j,k,vidx+1), Eo(i,j,k,vidx+2));
+                    const RealVect tn = r.crossProduct(vn);
+                    const RealVect to = r.crossProduct(vo);
+
+                    Gpu::Atomic::AddNoRet(sums + 0,  vn[0] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 1,  vn[1] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 2,  vn[2] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 3,  vo[0] * dvol * pvf_e);
+                    Gpu::Atomic::AddNoRet(sums + 4,  vo[1] * dvol * pvf_e);
+                    Gpu::Atomic::AddNoRet(sums + 5,  vo[2] * dvol * pvf_e);
+                    Gpu::Atomic::AddNoRet(sums + 6,  tn[0] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 7,  tn[1] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 8,  tn[2] * dvol * pvf_c);
+                    Gpu::Atomic::AddNoRet(sums + 9,  to[0] * dvol * pvf_e);
+                    Gpu::Atomic::AddNoRet(sums + 10, to[1] * dvol * pvf_e);
+                    Gpu::Atomic::AddNoRet(sums + 11, to[2] * dvol * pvf_e);
+                });
+            }
+        }
+        BL_PROFILE_VAR_STOP(blp_local);
+
+        // ---- one packed all-reduce, 6DOF on the I/O rank, one packed broadcast ----
+        BL_PROFILE_VAR("UpdateParticles::6dof_comm", blp_comm);
+        Gpu::copyAsync(Gpu::deviceToHost, d_sums.begin(), d_sums.end(), h_sums.begin());
+        Gpu::streamSynchronize();
+        ParallelAllReduce::Sum(h_sums.data(), NS * nk, ParallelDescriptor::Communicator());
+        for (int kidx = 0; kidx < nk; ++kidx) {
+            auto& kern = particle_kernels[kidx];
+            if (is_prescribed_fin(kern.geometry_type)) continue;
+            const Real* s = h_sums.data() + NS * kidx;
+            kern.sum_u_new = RealVect(s[0], s[1],  s[2]);
+            kern.sum_u_old = RealVect(s[3], s[4],  s[5]);
+            kern.sum_t_new = RealVect(s[6], s[7],  s[8]);
+            kern.sum_t_old = RealVect(s[9], s[10], s[11]);
+            SixDOFUpdate(kern, dt);
+        }
+        BroadcastKernelState();
+        BL_PROFILE_VAR_STOP(blp_comm);
+
+        loop--;
+    }
+
+    for (auto& kern : particle_kernels) {
+        if (!is_prescribed_fin(kern.geometry_type)) RecordOldValue(kern);
+    }
+
+    // ---- pvf of all particles: accumulate in particle order, valid cells only,
+    //      ghost cells stay zero (as in the reference path) ----
+    BL_PROFILE_VAR("UpdateParticles::pvf_accumulate", blp_acc);
+    pvf.setVal(0.0);
+    auto const& work_acc = PvfWorkList(pvf.boxArray(), pvf.DistributionMap(), loc_pvf, loc_pvf);
+    for (auto const& w : work_acc) {
+        auto const& kern = particle_kernels[w.kidx];
+        const RealVect loc = loc_pvf[w.kidx];
+        const Real a = kern.radius;
+        const Real b = kern.radius2;
+        const Real c = kern.radius3;
+        const int  gtype = kern.geometry_type;
+        auto const& pv = pvf.array(w.grid);
+        ParallelFor(w.ibx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            pv(i,j,k) += cell_pvf_at(i, j, k, dx, plo, loc[0], loc[1], loc[2], a, b, c, gtype);
+        });
+    }
+    BL_PROFILE_VAR_STOP(blp_acc);
+    BL_PROFILE_VAR_STOP(blp_phipvf);
+}
+
+void mParticle::UpdateParticles(int iStep,
+                                Real time,
+                                const MultiFab& Euler_old,
+                                const MultiFab& Euler,
+                                MultiFab& phi_nodal,
+                                MultiFab& pvf,
+                                Real dt)
+{
+    BL_PROFILE("mParticle::UpdateParticles");
+    if (verbose) Print() << "mParticle::UpdateParticles\n";
+    ib_time = time + dt;
+    // start record
+    auto UpdateParticlesStart = ParallelDescriptor::second();
+
+    //Particle Collision calculation
+    BL_PROFILE_VAR("UpdateParticles::collision", blp_coll);
+    DoParticleCollision(ParticleProperties::collision_model);
+    BL_PROFILE_VAR_STOP(blp_coll);
+
+    static bool printed_once = false;
+    if (!printed_once) {
+        printed_once = true;
+        amrex::Print() << "[Particle] : pvf_method = " << ParticleProperties::pvf_method
+                       << (ParticleProperties::pvf_method == 1
+                           ? " : bounding-box fused pvf/sums + packed MPI in use\n"
+                           : " : reference per-particle whole-domain pvf in use\n");
+    }
+    if (ParticleProperties::pvf_method == 1) {
+        UpdateParticlesFused(iStep, Euler_old, Euler, pvf, dt);
+    } else {
+        UpdateParticlesReference(iStep, Euler_old, Euler, phi_nodal, pvf, dt);
+    }
+
+    BL_PROFILE_VAR("UpdateParticles::print", blp_print);
     spend_time += ParallelDescriptor::second() - UpdateParticlesStart;
     ParallelDescriptor::ReduceRealMax(spend_time);
     Print() << "[DIBM] IB and update particle, step : "<< iStep <<", time : " << spend_time << "\n";
+    BL_PROFILE_VAR_STOP(blp_print);
 
     int particle_write_freq = ParticleProperties::write_freq;
     if (iStep % particle_write_freq == 0) {
-        for(auto kernel: particle_kernels) {
-            const Real output_time = is_prescribed_fin(kernel.geometry_type)
+        BL_PROFILE_VAR("UpdateParticles::write_csv", blp_csv);
+        // Every rank holds the complete particle state (all of it is either
+        // all-reduced or broadcast above), so spread the per-particle CSV
+        // files over the ranks round-robin. Creating a file on the parallel
+        // file system costs ~10-20 ms; doing all N of them on the I/O rank
+        // serialises N x that time and makes every other rank wait at the
+        // next collective.
+        const int nprocs = ParallelDescriptor::NProcs();
+        const int myproc = ParallelDescriptor::MyProc();
+        const int nk = static_cast<int>(particle_kernels.size());
+        for (int k = myproc; k < nk; k += nprocs) {
+            const Real output_time = is_prescribed_fin(particle_kernels[k].geometry_type)
                                    ? ib_time : time;
-            WriteIBForceAndMoment(iStep, output_time, dt, kernel);
+            WriteIBForceAndMoment(iStep, output_time, dt, particle_kernels[k]);
         }
+        BL_PROFILE_VAR_STOP(blp_csv);
     }
 
     // if (verbose) mContainer->WriteAsciiFile(Concatenate("particle", 4));
@@ -1388,8 +1851,15 @@ void mParticle::DoParticleCollision(int model)
             m_Collision.Particles.pop_front();
         }
     }
-    for(auto& kernel : particle_kernels){
-        ParallelDescriptor::Bcast(kernel.Fcp.dataPtr(), 3, ParallelDescriptor::IOProcessorNumber());
+    // one packed broadcast instead of one per particle
+    const int nk = static_cast<int>(particle_kernels.size());
+    Vector<Real> buf(3 * nk);
+    for (int k = 0; k < nk; ++k) {
+        for (int d = 0; d < 3; ++d) buf[3*k + d] = particle_kernels[k].Fcp[d];
+    }
+    ParallelDescriptor::Bcast(buf.data(), buf.size(), ParallelDescriptor::IOProcessorNumber());
+    for (int k = 0; k < nk; ++k) {
+        for (int d = 0; d < 3; ++d) particle_kernels[k].Fcp[d] = buf[3*k + d];
     }
 }
 
@@ -1533,7 +2003,7 @@ void mParticle::ResolveWithRPKM(std::string RKPM_file) {
         max_key = std::max(max_key, key);
         AMREX_ALWAYS_ASSERT(int(vec.size()) <= RKPM_STENCIL_SIZE);
     }
-    Gpu::HostVector<MAP_INFO> h_rkpm_flat((max_key + 1) * RKPM_STENCIL_SIZE);
+    h_rkpm_flat.resize((max_key + 1) * RKPM_STENCIL_SIZE);
     for (const auto& [key, vec] : RKPM_MAP) {
         const int n = int(vec.size());
         for (int j = 0; j < n; ++j) {
@@ -1574,11 +2044,10 @@ void mParticle::WriteParticleFile(int index)
     mContainer->WriteAsciiFile(Concatenate("particle", index));
 }
 
+// Writes one particle's CSV line from the calling rank. The caller decides
+// which rank writes which particle (see UpdateParticles).
 void mParticle::WriteIBForceAndMoment(int step, Real time, Real dt, kernel& current_kernel)
 {
-
-    if(ParallelDescriptor::MyProc() != ParallelDescriptor::IOProcessorNumber()) return;
-
     if (is_prescribed_fin(current_kernel.geometry_type)) {
         const std::string file = "IB_Fin_" + std::to_string(current_kernel.id)
                                + ".csv";
@@ -1647,6 +2116,7 @@ void Particles::create_particles(const Geometry &gm,
                                  const DistributionMapping & dm,
                                  const BoxArray & ba)
 {
+    BL_PROFILE("Particles::create_particles");
     Print() << "[Particle] : create Particle Container\n";
     if(particle->mContainer != nullptr){
         delete particle->mContainer;
@@ -1658,14 +2128,44 @@ void Particles::create_particles(const Geometry &gm,
     std::pair<int, int> key{0,0};
     auto& particleTileTmp = particle->mContainer->GetParticles(0)[key];
     //insert particle's markers
+    BL_PROFILE_VAR("create_particles::push_back_markers", blp_push);
+    // The container's tiles live in device memory: every push_back there is a
+    // one-element device fill + stream synchronisation (~10 us), i.e. tens of
+    // seconds for 1e5 markers x 11 attributes. Build the markers in a pinned
+    // host tile instead and move them to the device with one copyParticles().
+    using HostTile = amrex::ParticleTile<mParticleContainer::ParticleType, num_Real, num_Int, amrex::PinnedArenaAllocator>;
+    HostTile host_tile;
+    host_tile.define(0, 0);
+    // Every rank walks the full particle list (so ids and start_id are the same
+    // everywhere) but only inserts the markers of the particles whose centre
+    // lies in one of its own grids. This keeps the initial Redistribute from
+    // having to ship every marker out of rank 0 (~1 s per 1e5 markers).
+    const auto dxinv = gm.InvCellSizeArray();
+    const auto plo   = gm.ProbLoArray();
+    const int myproc = ParallelDescriptor::MyProc();
+    auto owns_centre = [&](const RealVect& loc) -> bool {
+        IntVect iv;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            iv[d] = static_cast<int>(std::floor((loc[d] - plo[d]) * dxinv[d]));
+        }
+        const auto isects = ba.intersections(Box(iv, iv), /*first_only=*/true, /*ng=*/0);
+        if (isects.empty()) {
+            // centre outside the domain: fall back to the I/O rank
+            return myproc == ParallelDescriptor::IOProcessorNumber();
+        }
+        return dm[isects[0].first] == myproc;
+    };
     int marker_index = 0;
-    for (auto& cur_p: particle->particle_kernels){
-        //insert markers
-        if ( ParallelDescriptor::MyProc() == ParallelDescriptor::IOProcessorNumber() ) {
+    {
+        for (auto& cur_p: particle->particle_kernels){
             if (particle->do_RKPM) {
                 cur_p.start_id = particle->StartOfLagrangianMarker(cur_p.id);
             }else {
                 cur_p.start_id = marker_index;
+            }
+            if (!owns_centre(cur_p.location)) {
+                marker_index += cur_p.ml;   // keep the global id numbering identical on all ranks
+                continue;
             }
             for(int i = 0; i < cur_p.ml; i++){
                 //insert code
@@ -1682,7 +2182,7 @@ void Particles::create_particles(const Geometry &gm,
                     markerP.pos(2) = pos[2];
                 }
 
-                std::array<ParticleReal, num_Real> Marker_attr;
+                std::array<ParticleReal, num_Real> Marker_attr{};
                 Marker_attr[U_Marker] = 0.0;
                 Marker_attr[V_Marker] = 0.0;
                 Marker_attr[W_Marker] = 0.0;
@@ -1693,15 +2193,22 @@ void Particles::create_particles(const Geometry &gm,
                 std::array<int, num_Int> Particle_id;
                 Particle_id[M_ID] = cur_p.id;
 
-                particleTileTmp.push_back(markerP);
-                particleTileTmp.push_back_real(Marker_attr);
-                particleTileTmp.push_back_int(Particle_id);
+                host_tile.push_back(markerP);
+                host_tile.push_back_real(Marker_attr);
+                host_tile.push_back_int(Particle_id);
             }
         }
-        // sync start index
-        ParallelDescriptor::Bcast(&cur_p.start_id, 1, ParallelDescriptor::IOProcessorNumber());
+        const auto np_host = host_tile.numParticles();
+        if (np_host > 0) {
+            particleTileTmp.resize(np_host);
+            amrex::copyParticles(particleTileTmp, host_tile);
+        }
     }
+    // start_id was computed identically on every rank above; no broadcast needed.
+    BL_PROFILE_VAR_STOP(blp_push);
+    BL_PROFILE_VAR("create_particles::Redistribute", blp_redist);
     particle->mContainer->Redistribute(); // Still needs to redistribute here!
+    BL_PROFILE_VAR_STOP(blp_redist);
 
     ParticleProperties::plo = gm.ProbLoArray();
     ParticleProperties::phi = gm.ProbHiArray();
@@ -1715,6 +2222,7 @@ mParticle* Particles::get_particles()
 
 void Particles::init_particle(Real gravity, Real h)
 {
+    BL_PROFILE("Particles::init_particle");
     Print() << "[Particle] : create Particle's kernel\n";
     particle = new mParticle;
     if(particle != nullptr){
@@ -1901,6 +2409,8 @@ void Particles::Initialize()
         p_file.query("collision_model", ParticleProperties::collision_model);
         p_file.query("write_freq",  ParticleProperties::write_freq);
         p_file.query("delta_type", ParticleProperties::delta_type);
+        p_file.query("reduce_method", ParticleProperties::reduce_method);
+        p_file.query("pvf_method", ParticleProperties::pvf_method);
         // update with RKPM method
         p_file.query("RKPM", ParticleProperties::RKPM);
 

@@ -319,6 +319,37 @@ public:
     void UpdateParticles(int iStep, Real time, const MultiFab& Euler_old, const MultiFab& Euler, MultiFab& phi_nodal, MultiFab& pvf, Real dt);
 
     /**
+     * Reference pvf / 6DOF update (particle_inputs.pvf_method = 0): whole-domain
+     * level set, pvf and reductions for every particle.
+     */
+    void UpdateParticlesReference(int iStep, const MultiFab& Euler_old, const MultiFab& Euler, MultiFab& phi_nodal, MultiFab& pvf, Real dt);
+
+    /**
+     * Bounding-box pvf / 6DOF update (particle_inputs.pvf_method = 1, default):
+     * per-particle work limited to the particle's own cells, packed MPI.
+     */
+    void UpdateParticlesFused(int iStep, const MultiFab& Euler_old, const MultiFab& Euler, MultiFab& pvf, Real dt);
+
+    /**
+     * 6DOF update of one particle on the I/O rank (no communication).
+     * @param kernel Particle to update
+     * @param dt Time step size
+     */
+    void SixDOFUpdate(kernel& kernel, Real dt);
+
+    /**
+     * Broadcast location/velocity/omega (+ *_old) of all particles from the I/O rank in one message.
+     */
+    void BroadcastKernelState();
+
+    /**
+     * Whether the marker container must be redistributed: true for prescribed
+     * fins, moved particle centres, or markers not yet redistributed.
+     * Updates the remembered centres when it returns true.
+     */
+    bool MarkersNeedRedistribute();
+
+    /**
      * Handle particle-particle collision interactions.
      * @param model Collision model identifier
      */
@@ -364,11 +395,23 @@ public:
      * @return Position vector of the marker
      */
     RealVect GetPositionOfMarker(size_t index);
-
+    void RefreshRKPMWeights();
     Vector<kernel> particle_kernels;
 
     /// GPU-accessible copy of kernel data for use in device lambdas.
     Gpu::DeviceVector<kernel_gpu> d_kernels;
+
+    /// Particle centres at the time of the last marker Redistribute (see MarkersNeedRedistribute).
+    Vector<RealVect> m_redistributed_loc;
+
+    /// One unit of pvf work: particle kidx on this rank's grid `grid`, cells `ibx`.
+    struct PvfWork { int kidx; int grid; Box ibx; };
+    /// Cached work list for UpdateParticlesFused (see PvfWorkList).
+    Vector<PvfWork> m_pvf_work;
+    Vector<RealVect> m_pvf_work_loc, m_pvf_work_loc_old;
+    BoxArray m_pvf_work_ba;
+    const Vector<PvfWork>& PvfWorkList(const BoxArray& ba, const DistributionMapping& dm,
+                                       const Vector<RealVect>& loc, const Vector<RealVect>& loc_old);
 
     /** \brief Sync particle_kernels host data to d_kernels device memory.
      *  Must be called after any host-side modification to particle_kernels
@@ -391,6 +434,7 @@ public:
     /// GPU-friendly flattened RKPM stencil data: d_rkpm_flat[id * RKPM_STENCIL_SIZE + cell_index]
     static constexpr int RKPM_STENCIL_SIZE = 27;
     Gpu::DeviceVector<MAP_INFO> d_rkpm_flat;
+    Gpu::HostVector<MAP_INFO> h_rkpm_flat;
 
     int max_largrangian_num = 0;
 
@@ -404,6 +448,7 @@ public:
     Real ib_time{0.0};
     // read write
     bool do_RKPM{false};
+    bool m_mpmd_exchange_done{false};
 };
 
 /// @}

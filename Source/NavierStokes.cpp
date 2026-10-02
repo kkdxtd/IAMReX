@@ -993,6 +993,31 @@ NavierStokes::velocity_diffusion_update (Real dt)
     }
 }
 
+namespace
+{
+    // nvcc rejects an extended __device__ lambda inside a member function with
+    // private or protected access, and sum_integrated_quantities() has sat in
+    // the protected section since 02684058 (2016). Keeping the kernel at file
+    // scope leaves that access control alone.
+    void sharpen_phase_indicator (const MultiFab& phi, MultiFab& sharp)
+    {
+#ifdef AMREX_USE_OMP
+#pragma omp parallel if (Gpu::notInLaunchRegion())
+#endif
+        for (MFIter mfi(sharp,TilingIfNotGPU()); mfi.isValid(); ++mfi)
+        {
+            const Box& bx = mfi.tilebox();
+            auto const& phifab   = phi.const_array(mfi);
+            auto const& sharpfab = sharp.array(mfi);
+            amrex::ParallelFor(bx, [phifab, sharpfab]
+            AMREX_GPU_DEVICE(int i, int j, int k) noexcept
+            {
+                sharpfab(i,j,k) = (phifab(i,j,k) > 0.0) ? 1.0 : 0.0;
+            });
+        }
+    }
+}
+
 void
 NavierStokes::sum_integrated_quantities ()
 {
@@ -1038,20 +1063,7 @@ NavierStokes::sum_integrated_quantities ()
             heavi_mf[lev] = std::make_unique<MultiFab>(S_new.boxArray(), S_new.DistributionMap(), 1, S_new.nGrow());
             sharp_mf[lev] = std::make_unique<MultiFab>(S_new.boxArray(), S_new.DistributionMap(), 1, 0);
             phi_to_heavi(ns_level.Geom(), epsilon, phi_alias, *heavi_mf[lev]);
-#ifdef AMREX_USE_OMP
-#pragma omp parallel if (Gpu::notInLaunchRegion())
-#endif
-            for (MFIter mfi(*sharp_mf[lev],TilingIfNotGPU()); mfi.isValid(); ++mfi)
-            {
-                const Box& bx = mfi.tilebox();
-                auto const& phifab   = phi_alias.const_array(mfi);
-                auto const& sharpfab = sharp_mf[lev]->array(mfi);
-                amrex::ParallelFor(bx, [phifab, sharpfab]
-                AMREX_GPU_DEVICE(int i, int j, int k) noexcept
-                {
-                    sharpfab(i,j,k) = (phifab(i,j,k) > 0.0) ? 1.0 : 0.0;
-                });
-            }
+            sharpen_phase_indicator(phi_alias, *sharp_mf[lev]);
             heavi_ptrs[lev] = heavi_mf[lev].get();
             sharp_ptrs[lev] = sharp_mf[lev].get();
         }
